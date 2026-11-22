@@ -456,6 +456,9 @@ fn transmit(opts: &Opts) -> (i32, String) {
             opts.caller,
             opts.timeout,
         ) {
+            // open_with_params runs the device hello (licence challenge) before the
+            // channel bring-up, as the vendor DLL does; the simulate() path uses
+            // with_port, which does no hello, so its fake serial is unaffected.
             Ok(s) => s.with_can_ids(opts.req_header, opts.resp_header),
             Err(e) => {
                 logln(&mut log, format!("  !! could not open the dongle: {e}"));
