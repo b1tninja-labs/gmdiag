@@ -680,8 +680,11 @@ mod tests {
         let seam = transport.into_source();
         let writes = seam.port().writes.borrow();
         assert_eq!(writes.len(), 4);
-        let expected_request =
-            vcxtoolkit::collect::frame_identity_request(&build_identity_request(0xC1)).unwrap();
+        let expected_request = vcxtoolkit::collect::frame_identity_request_with_flags(
+            vcxtoolkit::collect::ISO15765_FRAME_PAD,
+            &build_identity_request(0xC1),
+        )
+        .unwrap();
         assert_eq!(
             writes[3],
             pack(

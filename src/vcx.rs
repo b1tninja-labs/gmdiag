@@ -180,7 +180,9 @@ impl<B: ByteSource> Transport for VcxTransport<B> {
     }
 
     fn request(&mut self, pdu: &[u8]) -> Result<Vec<u8>> {
-        let framed = collect::frame_identity_request(pdu)?;
+        // Pad the ISO 15765 single frame to 8 bytes (VCX PDU flag 0x200, the recovered
+        // ISO15765_FRAME_PAD): GM ECUs ignore an unpadded single frame.
+        let framed = collect::frame_identity_request_with_flags(collect::ISO15765_FRAME_PAD, pdu)?;
         let reply = self.source.exchange(&framed)?;
         let application = collect::reply_application_bytes(&reply)?;
         Ok(application.to_vec())
@@ -363,9 +365,10 @@ mod tests {
             VcxTransport::new(FakeByteSource::new(vec![positive_reply(0xC1, &[0x2A])]));
         let read = read_identity(&mut transport, 0xC1).unwrap();
         assert_eq!(read, IdentifierRead::lid(0xC1, vec![0x2A]));
+        // Flags 0x200 (ISO15765_FRAME_PAD), len 2, then `1A C1`.
         assert_eq!(
             transport.source().sent(),
-            &[vec![0, 0, 0, 0, 0, 2, 0x1A, 0xC1]],
+            &[vec![0, 0, 0x02, 0, 0, 2, 0x1A, 0xC1]],
         );
     }
 
