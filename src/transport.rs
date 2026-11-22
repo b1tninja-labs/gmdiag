@@ -13,6 +13,7 @@
 
 pub mod elm327;
 pub mod isotp_can;
+pub mod vci;
 
 use crate::error::Result;
 

@@ -23,7 +23,11 @@ Tests live beside the code (`src/**` `#[cfg(test)]`) and in `tests/fakeobd_live.
 | [ok] | The planned raw-CAN transport frames a PDU with isotpkit | ISO 15765-2:2016 §9.2.1 | `transport::isotp_can::tests::a_short_pdu_segments_into_one_frame` |
 | [ok] | The raw-CAN transport refuses `request` until a CAN interface exists (no guessing) | — | `transport::isotp_can::tests::request_is_refused_until_an_interface_exists` |
 | [open] | A live raw-CAN (`IsoTpCan`) link over SocketCAN / a real interface | ISO 15765-2:2016 | none |
-| [open] | A J2534 / VCX transport via vcxtoolkit | SAE J2534 (not in primarysource) | none |
+| [ok] | `VciTransport<B: RawBackend>` carries a UDS PDU over any `vcikit` raw-mode backend: `set_target` → `connect`, `request` → send then recv | ISO 22900-2:2009 §9.2.6.3.6 (4-byte CAN-id prefix, owned by vcikit) | `transport::vci::tests::request_sends_the_unframed_pdu_and_returns_the_response` |
+| [ok] | The `vcikit` transport is neutral: a negative-response PDU passes through unchanged | — | `transport::vci::tests::a_negative_response_passes_through_unchanged` |
+| [ok] | `read_more` reads a `0x78` follow-up without sending, so the session's response-pending loop runs over `vcikit` | ISO 14229-1:2013 §7.5.1 | `transport::vci::tests::the_0x78_loop_runs_through_a_session_over_this_transport` |
+| [open] | First-party native-VCX backend, selected before J2534, once `vcikit` exposes `NativeVcx` as a `RawBackend` | vcikit `NativeVcx`; vcxtoolkit raw-mode channel bring-up | none |
+| [open] | `VciTransport::open_j2534` drives a live registered SAE J2534 pass-through DLL on a vehicle | `sae:j2534-2002`; ISO 15765 raw mode (via vcikit-j2534) | none |
 | [open] | End-to-end against obd-bridge + a real ELM327/STN adapter | — (needs hardware) | none |
 
 ## Session core

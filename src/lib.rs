@@ -13,7 +13,9 @@
 //! - [`transport`] — the one seam. A [`Transport`](transport::Transport) sends a UDS application
 //!   PDU and returns the reassembled response. [`Elm327Tcp`](transport::elm327::Elm327Tcp) is the
 //!   primary impl (an ELM327 adapter that runs ISO-TP); [`IsoTpCan`](transport::isotp_can::IsoTpCan)
-//!   is the planned raw-CAN impl over `isotpkit`.
+//!   is the planned raw-CAN impl over `isotpkit`; [`VciTransport`](transport::vci::VciTransport)
+//!   bridges onto `vcikit`'s raw-mode backend seam (a native-VCX or a registered SAE J2534
+//!   pass-through), with the device FFI isolated in `vcikit-j2534` so gmdiag stays `unsafe`-free.
 //! - [`session`] — a [`Session`](session::Session) over a transport: session control,
 //!   TesterPresent keep-alive, the `0x78` response-pending loop, and the UDS services, each
 //!   write/actuation gated by an [`Arm`](session::Arm) level.
@@ -40,7 +42,9 @@
 //! gmdiag derives **no** SecurityAccess key: it builds and reads a `requestSeed`, but a `sendKey`
 //! carries only a key the operator supplies. It opens no bus beyond the ELM line protocol (raw
 //! CAN and J2534/VCX are planned). It acts only on an owner-authorised vehicle, and its whole
-//! stack runs against a spawned `fakeobd` simulator with no hardware.
+//! stack runs against a spawned `fakeobd` simulator with no hardware. A J2534 / native-VCX link
+//! runs through `vcikit`'s raw-mode backend ([`VciTransport`](transport::vci::VciTransport)); the
+//! `unsafe` device FFI stays in `vcikit-j2534`, never in gmdiag.
 
 pub mod cli;
 pub mod error;
