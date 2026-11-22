@@ -65,6 +65,10 @@ struct Opts {
     /// hardware), which returns a positive `$7E`/`$5A` for every request. Proves the
     /// reader's bring-up/send/recv/parse path end to end on any platform.
     simulate: bool,
+    /// Vendor transport: the path to a J2534 pass-through DLL (VXDIAG `VCXPT32.dll`).
+    /// When set, the read runs the SAME loop over the vendor DLL (via `vcikit-j2534`)
+    /// instead of the native VCX serial path, producing the identical saved-read.
+    dll: Option<String>,
     /// The `$1A` identifiers to read, in order.
     lids: Vec<u8>,
     /// Where to write the assembled saved-read, if anywhere.
@@ -92,6 +96,7 @@ impl Default for Opts {
             print_only: false,
             ping: false,
             simulate: false,
+            dll: None,
             lids: DEFAULT_IDENTITY_LIDS.to_vec(),
             out: None,
             ecu: "BECM".to_string(),
@@ -407,62 +412,100 @@ fn transmit(opts: &Opts) -> (i32, String) {
         Ok(lines) => log.push_str(&lines),
         Err(e) => return (1, format!("{log}\nerror building open plan: {e}")),
     }
-
     logln(&mut log, "");
-    logln(
-        &mut log,
-        format!("opening VCX-NANO on COM{} ...", opts.port),
-    );
-    let mut source =
-        match VcxByteSource::open_with_params(opts.port, opts.channel, opts.caller, opts.timeout) {
+
+    // One read loop, two interchangeable transports: the native VCX serial path, or
+    // the vendor J2534 DLL (--dll). Both drive the same `drive_read`, so the saved-read
+    // is identical — only the carrier of the bytes differs.
+    let code = if let Some(dll) = &opts.dll {
+        logln(&mut log, format!("opening vendor J2534 DLL {dll} ..."));
+        let mut source = match crate::vcx_j2534::J2534ByteSource::open(
+            std::path::Path::new(dll),
+            opts.req_header,
+            opts.resp_header,
+            opts.timeout,
+        ) {
+            Ok(source) => {
+                logln(
+                    &mut log,
+                    format!("  loaded vendor DLL: {}", source.library_path()),
+                );
+                source
+            }
+            Err(e) => {
+                logln(&mut log, format!("  !! could not load the vendor DLL: {e}"));
+                return (1, log);
+            }
+        };
+        logln(
+            &mut log,
+            "  first exchange brings up ISO 15765 through the vendor DLL \
+             (PassThruOpen / Connect / StartMsgFilter).",
+        );
+        drive_read(&mut source, opts, &mut log)
+    } else {
+        logln(
+            &mut log,
+            format!("opening VCX-NANO on COM{} ...", opts.port),
+        );
+        let mut source = match VcxByteSource::open_with_params(
+            opts.port,
+            opts.channel,
+            opts.caller,
+            opts.timeout,
+        ) {
             Ok(s) => s.with_can_ids(opts.req_header, opts.resp_header),
             Err(e) => {
                 logln(&mut log, format!("  !! could not open the dongle: {e}"));
                 return (1, log);
             }
         };
-    logln(
-        &mut log,
-        "  dongle port opened. The first exchange brings up the ISO 15765 channel \
-         (open, SetComParam, flow-control AddFilter, Start) before any vehicle byte.",
-    );
+        logln(
+            &mut log,
+            "  dongle port opened. The first exchange brings up the ISO 15765 channel \
+             (open, SetComParam, flow-control AddFilter, Start) before any vehicle byte.",
+        );
+        drive_read(&mut source, opts, &mut log)
+    };
+    (code, log)
+}
 
-    // TesterPresent first: the safest real transmission. For --ping it is the whole
-    // job; otherwise it is the preflight, and a non-positive answer stops the read.
-    logln(&mut log, "");
-    logln(&mut log, "TesterPresent probe ($3E 00):");
-    let proven = tester_present(&mut source, opts.req_header, &mut log);
+/// The transport-agnostic read: the TesterPresent preflight (the whole job for
+/// `--ping`), then the `$1A` identity loop. Shared by the native and vendor transports
+/// so both produce the identical saved-read. Returns the process exit code.
+fn drive_read(source: &mut dyn crate::vcx::ByteSource, opts: &Opts, log: &mut String) -> i32 {
+    logln(log, "");
+    logln(log, "TesterPresent probe ($3E 00):");
+    let proven = tester_present(source, opts.req_header, log);
     if opts.ping {
-        logln(&mut log, "");
+        logln(log, "");
         return if proven.is_ok() {
             logln(
-                &mut log,
-                "PROBE OK: the VCX exchange is proven on this vehicle. Re-run without --ping \
+                log,
+                "PROBE OK: the exchange is proven on this vehicle. Re-run without --ping \
                  to read the $1A identities.",
             );
-            (0, log)
+            0
         } else {
             logln(
-                &mut log,
+                log,
                 "PROBE FAILED: the pipe did not return a positive $7E (bytes above). Debug the \
-                 VCX transport on this simplest case before attempting the $1A read.",
+                 transport on this simplest case before attempting the $1A read.",
             );
-            (1, log)
+            1
         };
     }
     let Ok(proof) = proven else {
-        logln(&mut log, "");
+        logln(log, "");
         logln(
-            &mut log,
+            log,
             "PREFLIGHT FAILED: TesterPresent did not return a positive $7E (bytes above). \
              Stopping before the $1A read — the transport is not proven, so a $1A attempt \
              would only add noise. Fix the probe first (or re-run with --ping to iterate it).",
         );
-        return (1, log);
+        return 1;
     };
-
-    let code = read_identities_live(&mut source, opts, &mut log, proof);
-    (code, log)
+    read_identities_live(source, opts, log, proof)
 }
 
 #[cfg(not(windows))]
@@ -849,6 +892,7 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--print-only" => opts.print_only = true,
             "--ping" => opts.ping = true,
             "--simulate" => opts.simulate = true,
+            "--dll" => opts.dll = Some(next(&mut it, "--dll")?.clone()),
             "--port" => {
                 opts.port = parse_port(next(&mut it, "--port")?)?;
                 port_set = true;
@@ -874,7 +918,7 @@ fn parse(args: &[String]) -> Result<Opts> {
             }
         }
     }
-    if !port_set && !opts.simulate {
+    if !port_set && !opts.simulate && opts.dll.is_none() {
         return Err(Error::Refused(
             "vcx-read needs --port <N> (the COM number the doctor/detection layer found)".into(),
         ));

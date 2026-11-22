@@ -19,6 +19,13 @@ mode06kit = { path = "../mode06kit" }
 # and the saved module-read writer (modread) for the offline identity-collection adapter.
 vcxtoolkit = { path = "../vcxtoolkit" }
 
+# The vendor-DLL read transport (Windows only): vcikit-j2534 loads a registered/located
+# J2534 pass-through DLL (VXDIAG VCXPT32.dll), so `vcx-read --dll <path>` runs the SAME
+# read loop over the vendor DLL and produces the identical saved-read as the native path.
+[target.'cfg(windows)'.dependencies]
+vcikit = { path = "../vcikit" }
+vcikit-j2534 = { path = "../vcikit/j2534" }
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
