@@ -26,6 +26,12 @@
 //!   detection-selected COM number (never hardcoded). The seam logic is tested over a fake serial;
 //!   the live vehicle read stays held behind `vcxtoolkit::collect::vehicle_read_gate` and is reached
 //!   only by an `#[ignore]`d, owner-gated hardware test.
+//! - [`vcx_read`] — the real-hardware, owner-gated, **read-only** `$1A` identity read command:
+//!   the one CLI path that transmits to a vehicle through the VCX-NANO. Without `--owner-unhold`
+//!   (and off Windows) it is a dry run that opens nothing and sends nothing; with it, on Windows,
+//!   it drives [`vcx_device::VcxByteSource`] and logs every byte. It
+//!   builds only GMLAN `$1A`, never `$27`, and reaches no write or actuation path. The live
+//!   exchange is unproven on hardware.
 //! - [`cli`] — the read-first command line.
 //!
 //! # Boundaries
@@ -42,6 +48,7 @@ pub mod spawn;
 pub mod transport;
 pub mod vcx;
 pub mod vcx_device;
+pub mod vcx_read;
 
 pub use error::{Error, Result};
 
