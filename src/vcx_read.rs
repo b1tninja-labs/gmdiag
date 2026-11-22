@@ -114,7 +114,7 @@ impl Default for Opts {
 /// Transmits by default on Windows with a port. `--print-only` (or any non-Windows
 /// platform) makes it a dry run that opens nothing and sends nothing. The read stays
 /// read-only: only `$3E`/`$1A` are ever built (the `frame_request` guard), and the
-/// `$1A` loop is still blocked behind a positive TesterPresent (`PipeProven`).
+/// `$1A` loop runs unconditionally (no preflight gate); TesterPresent is informational.
 #[must_use]
 pub fn run(args: &[String]) -> (i32, String) {
     let opts = match parse(args) {
@@ -283,23 +283,21 @@ fn simulate(opts: &Opts) -> (i32, String) {
         &mut log,
         "TesterPresent probe ($3E 00) [over the native transport]:",
     );
-    let Ok(proof) = tester_present(&mut source, opts.req_header, &mut log) else {
-        logln(&mut log, "");
-        logln(
-            &mut log,
-            "SIMULATE FAILED: the native transport did not return a positive $7E from the fake.",
-        );
-        return (1, log);
-    };
+    let proven = tester_present(&mut source, opts.req_header, &mut log);
     if opts.ping {
         logln(&mut log, "");
-        logln(
-            &mut log,
-            "SIMULATE PROBE OK: the native transport parsed a positive $7E.",
-        );
-        return (0, log);
+        return if proven.is_ok() {
+            logln(
+                &mut log,
+                "SIMULATE PROBE OK: the native transport parsed a positive $7E.",
+            );
+            (0, log)
+        } else {
+            logln(&mut log, "SIMULATE PROBE: no positive $7E from the fake.");
+            (1, log)
+        };
     }
-    let code = read_identities_live(&mut source, opts, &mut log, proof);
+    let code = read_identities_live(&mut source, opts, &mut log);
     (code, log)
 }
 
@@ -495,17 +493,21 @@ fn drive_read(source: &mut dyn crate::vcx::ByteSource, opts: &Opts, log: &mut St
             1
         };
     }
-    let Ok(proof) = proven else {
-        logln(log, "");
-        logln(
+    // No preflight gate: the $1A read runs whether or not TesterPresent returned a
+    // positive $7E, so the real per-lid bytes are always on the record. A finicky $3E
+    // must never hide a valid $1A reply.
+    match proven {
+        Ok(()) => logln(
             log,
-            "PREFLIGHT FAILED: TesterPresent did not return a positive $7E (bytes above). \
-             Stopping before the $1A read — the transport is not proven, so a $1A attempt \
-             would only add noise. Fix the probe first (or re-run with --ping to iterate it).",
-        );
-        return 1;
-    };
-    read_identities_live(source, opts, log, proof)
+            "TesterPresent returned a positive $7E; running the $1A read.",
+        ),
+        Err(_) => logln(
+            log,
+            "TesterPresent did not return a positive $7E — running the $1A read anyway; the \
+             raw per-lid bytes are below.",
+        ),
+    }
+    read_identities_live(source, opts, log)
 }
 
 #[cfg(not(windows))]
@@ -515,21 +517,11 @@ fn transmit(opts: &Opts) -> (i32, String) {
     dry_run(opts, false)
 }
 
-/// Run the `$1A` identity loop over `source` (the TesterPresent preflight already
-/// passed), assemble and serialize the saved-read, and write `--out` if set.
-/// Returns the process exit code. Driven over any [`ByteSource`], so it is unit-tested
-/// over the fake serial. It is reached only from the Windows `transmit`.
-///
-/// The `_proof: PipeProven` parameter is the gate: this function cannot be called
-/// without a token minted by a positive [`tester_present`], so the `$1A` read is
-/// structurally unreachable until the pipe is proven. Reached from the Windows
-/// `transmit` and from `--simulate` (which runs on any platform).
-fn read_identities_live(
-    source: &mut dyn ByteSource,
-    opts: &Opts,
-    log: &mut String,
-    _proof: PipeProven,
-) -> i32 {
+/// Run the `$1A` identity loop over `source`, assemble and serialize the saved-read,
+/// and write `--out` if set. Returns the process exit code. Driven over any
+/// [`ByteSource`], so it is unit-tested over the fake serial. It runs unconditionally —
+/// there is no preflight gate — so a valid `$1A` reply is never withheld.
+fn read_identities_live(source: &mut dyn ByteSource, opts: &Opts, log: &mut String) -> i32 {
     let mut reads = Vec::new();
     let mut failures = 0u32;
     logln(log, "");
@@ -723,34 +715,18 @@ fn split_rx_id(data: &[u8]) -> Option<(u32, &[u8])> {
 
 /// Proof that the VCX pipe answered a TesterPresent with a positive `$7E`.
 ///
-/// This is an internal capability token, in the spirit of the crate's other gates
-/// (`session::Arm`, `vcxtoolkit::collect::vehicle_read_gate`): it is zero-sized and
-/// only [`tester_present`] mints one, so the `$1A` identity loop
-/// ([`read_identities_live`]) — which **requires** a `PipeProven` — is structurally
-/// unreachable until the probe has come back positive. A future caller cannot forget
-/// the preflight; the type system forbids skipping it.
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, Copy)]
-#[must_use]
-struct PipeProven(());
-
-/// Send TesterPresent (`$3E 00`) and, on a positive `$7E`, mint the [`PipeProven`]
-/// token that unlocks the `$1A` read.
+/// Send TesterPresent (`$3E 00`) and report whether it returned a positive `$7E`.
 ///
-/// This is the safest real transmission: it reads no data and changes no state, so it
-/// is the first probe (via `--ping`) and the preflight before the `$1A` loop. On any
-/// non-positive answer the bytes are already dumped by [`exchange_and_unwrap`] and no
-/// token is returned, so the read cannot proceed.
+/// This is the safest real transmission: it reads no data and changes no state, so it is
+/// the first probe (via `--ping`) and an informational check before the `$1A` loop. It is
+/// **not** a gate — the `$1A` read runs regardless; a non-positive answer here only means
+/// the probe did not confirm, not that the identities cannot be read.
 ///
 /// # Errors
 /// Transport/envelope errors from [`exchange_and_unwrap`]; [`Error::Negative`] on a
 /// `0x7F` answer; [`Error::Protocol`] when the positive response id is not `$7E`.
 #[cfg(any(windows, test))]
-fn tester_present(
-    source: &mut dyn ByteSource,
-    req_id: u16,
-    log: &mut String,
-) -> Result<PipeProven> {
+fn tester_present(source: &mut dyn ByteSource, req_id: u16, log: &mut String) -> Result<()> {
     use udskit::message::{Response, decode_response};
 
     let app = exchange_and_unwrap(source, &build_tester_present(), req_id, log)?;
@@ -758,9 +734,9 @@ fn tester_present(
         Response::Positive(p) if p.response_sid == TESTER_PRESENT_POSITIVE_SID => {
             logln(
                 log,
-                "  == TesterPresent OK (positive $7E) — the VCX pipe works; $1A read unlocked.",
+                "  == TesterPresent OK (positive $7E) — the VCX pipe works.",
             );
-            Ok(PipeProven(()))
+            Ok(())
         }
         Response::Positive(p) => {
             let e = Error::Protocol(format!(
@@ -1269,8 +1245,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn read_identities_live_assembles_over_the_fake_serial() {
-        // The $1A loop is gated by a PipeProven token: the test earns it by running the
-        // TesterPresent probe first (positive $7E), then reads two identities.
+        // Run the TesterPresent probe first (it consumes the probe frame), then read two
+        // identities. There is no gate — read_identities_live runs regardless of the probe.
         let mut source = FakeByteSource::new(vec![
             tp_positive(),
             positive(0xC1, &[0x00, 0x00, 0x00, 0x2A]),
@@ -1279,8 +1255,9 @@ mod tests {
         let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
         opts.lids = vec![0xC1, 0xCC];
         let mut log = String::new();
-        let proof = tester_present(&mut source, opts.req_header, &mut log).expect("probe positive");
-        let code = read_identities_live(&mut source, &opts, &mut log, proof);
+        // Consume the probe frame; the $1A read no longer needs a proof token.
+        tester_present(&mut source, opts.req_header, &mut log).expect("probe positive");
+        let code = read_identities_live(&mut source, &opts, &mut log);
         assert_eq!(code, 0);
         assert!(log.contains("lid C1 0000002A"), "{log}");
         assert!(log.contains("lid CC 56494E"), "{log}");
@@ -1296,8 +1273,8 @@ mod tests {
         let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
         opts.lids = vec![0xC1];
         let mut log = String::new();
-        let proof = tester_present(&mut source, opts.req_header, &mut log).expect("probe positive");
-        assert_eq!(read_identities_live(&mut source, &opts, &mut log, proof), 1);
+        tester_present(&mut source, opts.req_header, &mut log).expect("probe positive");
+        assert_eq!(read_identities_live(&mut source, &opts, &mut log), 1);
         assert!(log.contains("no identities read"), "{log}");
     }
 }
