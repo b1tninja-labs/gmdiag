@@ -4,11 +4,16 @@
 //! This is the one CLI path that actually transmits to a vehicle through the
 //! VCX-NANO. It is deliberately narrow and loud:
 //!
-//! - **Read-only.** It builds only the GMLAN `$1A` ReadDataByIdentifier request
-//!   (`udskit`, via [`build_identity_request`]),
-//!   frames it with the recovered codecs, and parses the `$5A` reply. It never
-//!   builds or sends SecurityAccess `$27`, and no write or actuation service is
-//!   reachable from here.
+//! - **Read-only.** It builds only two read-only services — TesterPresent
+//!   (`$3E 00`, the keep-alive probe) and GMLAN `$1A` ReadDataByIdentifier
+//!   (`udskit`, via [`build_identity_request`]) — frames them with the recovered
+//!   codecs, and parses the `$7E` / `$5A` replies. A runtime guard (`frame_request`)
+//!   refuses to transmit any other service, so it never builds or sends
+//!   SecurityAccess `$27`, and no write or actuation is reachable.
+//! - **TesterPresent first.** The safest real transmission is `$3E 00`: it reads no
+//!   data and changes no state. `--ping` sends only that (the "does the pipe work at
+//!   all?" test); the full `$1A` read runs a TesterPresent **preflight** first and
+//!   stops, dumping the bytes, if it does not come back positive.
 //! - **Owner-gated.** Without `--owner-unhold` it is a **dry run**: it builds and
 //!   prints the framed request bytes and the channel-open plan, opens nothing, and
 //!   sends nothing. Only with `--owner-unhold` (and a `y` at the confirmation) does
@@ -42,6 +47,9 @@ struct Opts {
     port: u32,
     /// Explicit owner consent: without it this is a dry run that transmits nothing.
     owner_unhold: bool,
+    /// TesterPresent-only mode: transmit just `$3E 00` and stop (the "does the pipe
+    /// work at all?" probe). Skips the `$1A` identity loop entirely.
+    ping: bool,
     /// The `$1A` identifiers to read, in order.
     lids: Vec<u8>,
     /// Where to write the assembled saved-read, if anywhere.
@@ -65,6 +73,7 @@ impl Default for Opts {
         Self {
             port: 0,
             owner_unhold: false,
+            ping: false,
             lids: DEFAULT_IDENTITY_LIDS.to_vec(),
             out: None,
             ecu: "BECM".to_string(),
@@ -109,25 +118,48 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
         Err(e) => return (1, format!("{log}\nerror building open plan: {e}")),
     }
 
+    // The TesterPresent probe is sent first in every real mode (alone for --ping, as
+    // the preflight before the $1A loop otherwise). Show it first here too.
     logln(&mut log, "");
     logln(
         &mut log,
-        "framed $1A requests that WOULD be sent (nothing is transmitted):",
+        "TesterPresent probe that WOULD be sent FIRST (nothing is transmitted):",
     );
-    for &lid in &opts.lids {
-        match frame_lid(lid) {
-            Ok((req, framed)) => {
-                logln(&mut log, format!("  lid {lid:02X}:"));
-                logln(
-                    &mut log,
-                    format!("    UDS request (udskit 1A <lid>): {}", hex(&req)),
-                );
-                logln(
-                    &mut log,
-                    format!("    framed VCX_PRO_Send PDU:       {}", hex(&framed)),
-                );
+    match frame_for_display(build_tester_present()) {
+        Ok((req, framed)) => {
+            logln(
+                &mut log,
+                format!("    UDS request (3E 00):           {}", hex(&req)),
+            );
+            logln(
+                &mut log,
+                format!("    framed VCX_PRO_Send PDU:       {}", hex(&framed)),
+            );
+        }
+        Err(e) => return (1, format!("{log}\nerror framing TesterPresent: {e}")),
+    }
+
+    if !opts.ping {
+        logln(&mut log, "");
+        logln(
+            &mut log,
+            "framed $1A requests that WOULD follow a positive probe (nothing is transmitted):",
+        );
+        for &lid in &opts.lids {
+            match frame_for_display(build_identity_request(lid)) {
+                Ok((req, framed)) => {
+                    logln(&mut log, format!("  lid {lid:02X}:"));
+                    logln(
+                        &mut log,
+                        format!("    UDS request (udskit 1A <lid>): {}", hex(&req)),
+                    );
+                    logln(
+                        &mut log,
+                        format!("    framed VCX_PRO_Send PDU:       {}", hex(&framed)),
+                    );
+                }
+                Err(e) => return (1, format!("{log}\nerror framing lid {lid:02X}: {e}")),
             }
-            Err(e) => return (1, format!("{log}\nerror framing lid {lid:02X}: {e}")),
         }
     }
 
@@ -139,10 +171,17 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
              staying a dry run on this platform.",
         );
     }
+    let what = if opts.ping {
+        "the TesterPresent probe above"
+    } else {
+        "the TesterPresent preflight then the $1A read above"
+    };
     logln(
         &mut log,
-        "DRY RUN COMPLETE: no port opened, no byte sent. Re-run with --owner-unhold on \
-         Windows to open the dongle and transmit the $1A read above.",
+        format!(
+            "DRY RUN COMPLETE: no port opened, no byte sent. Re-run with --owner-unhold on \
+             Windows to open the dongle and transmit {what}."
+        ),
     );
     (0, log)
 }
@@ -154,17 +193,29 @@ fn transmit(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String)
     use crate::vcx_device::VcxByteSource;
 
     let mut log = String::new();
-    header(&mut log, opts, "LIVE READ (owner-unhold)");
+    let mode = if opts.ping {
+        "LIVE TesterPresent PROBE (owner-unhold)"
+    } else {
+        "LIVE READ (owner-unhold)"
+    };
+    header(&mut log, opts, mode);
     match open_plan_lines(opts) {
         Ok(lines) => log.push_str(&lines),
         Err(e) => return (1, format!("{log}\nerror building open plan: {e}")),
     }
 
-    let prompt = format!(
-        "VCX $1A identity READ on COM{} — READ-ONLY ({} identifiers, no $27, no writes)",
-        opts.port,
-        opts.lids.len()
-    );
+    let prompt = if opts.ping {
+        format!(
+            "VCX TesterPresent probe ($3E 00) on COM{} — READ-ONLY (reads nothing, no $27, no writes)",
+            opts.port
+        )
+    } else {
+        format!(
+            "VCX $1A identity READ on COM{} — READ-ONLY (TesterPresent preflight + {} identifiers, no $27, no writes)",
+            opts.port,
+            opts.lids.len()
+        )
+    };
     if !confirm(&prompt) {
         logln(&mut log, "");
         logln(
@@ -189,27 +240,79 @@ fn transmit(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String)
         };
     logln(&mut log, "  dongle port opened (no vehicle byte sent yet).");
 
+    // TesterPresent first: the safest real transmission. For --ping it is the whole
+    // job; otherwise it is the preflight, and a non-positive answer stops the read.
+    logln(&mut log, "");
+    logln(&mut log, "TesterPresent probe ($3E 00):");
+    let probe = tester_present(&mut source, &mut log);
+    if opts.ping {
+        logln(&mut log, "");
+        return if probe.is_ok() {
+            logln(
+                &mut log,
+                "PROBE OK: the VCX exchange is proven on this vehicle. Re-run without --ping \
+                 to read the $1A identities.",
+            );
+            (0, log)
+        } else {
+            logln(
+                &mut log,
+                "PROBE FAILED: the pipe did not return a positive $7E (bytes above). Debug the \
+                 VCX transport on this simplest case before attempting the $1A read.",
+            );
+            (1, log)
+        };
+    }
+    if probe.is_err() {
+        logln(&mut log, "");
+        logln(
+            &mut log,
+            "PREFLIGHT FAILED: TesterPresent did not return a positive $7E (bytes above). \
+             Stopping before the $1A read — the transport is not proven, so a $1A attempt would \
+             only add noise. Fix the probe first (or re-run with --ping to iterate it).",
+        );
+        return (1, log);
+    }
+
+    let code = read_identities_live(&mut source, opts, &mut log);
+    (code, log)
+}
+
+#[cfg(not(windows))]
+fn transmit(opts: &Opts, _confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String) {
+    // Unreachable from `run` off Windows (it routes to `dry_run`); kept so the symbol
+    // exists on every platform.
+    dry_run(opts, false)
+}
+
+/// Run the `$1A` identity loop over `source` (the TesterPresent preflight already
+/// passed), assemble and serialize the saved-read, and write `--out` if set.
+/// Returns the process exit code. Driven over any [`ByteSource`], so it is unit-tested
+/// over the fake serial. It is reached only from the Windows `transmit`.
+#[cfg(windows)]
+fn read_identities_live(source: &mut dyn ByteSource, opts: &Opts, log: &mut String) -> i32 {
     let mut reads = Vec::new();
     let mut failures = 0u32;
-    logln(&mut log, "");
+    logln(log, "");
     for &lid in &opts.lids {
-        logln(&mut log, format!("lid {lid:02X}:"));
-        match read_one_identity(&mut source, lid, &mut log) {
+        logln(log, format!("lid {lid:02X}:"));
+        match read_one_identity(source, lid, log) {
             Ok(read) => reads.push(read),
             Err(_) => failures += 1,
         }
     }
 
-    logln(&mut log, "");
+    logln(log, "");
     if reads.is_empty() {
         logln(
-            &mut log,
+            log,
             "no identities read: every exchange failed (see the byte dumps above). The live \
              exchange is unproven on hardware — these raw bytes are how we fix the codecs.",
         );
-        return (1, log);
+        return 1;
     }
 
+    let read_count = opts.lids.len() - failures as usize;
     match crate::vcx::assemble_module_read(
         &opts.ecu,
         opts.req_header,
@@ -221,63 +324,82 @@ fn transmit(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String)
     {
         Ok(saved) => {
             logln(
-                &mut log,
+                log,
                 format!(
-                    "parsed {} identit{} ({} failed). saved-read ({}):",
-                    opts.lids.len() - failures as usize,
-                    if opts.lids.len() - failures as usize == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                    failures,
+                    "parsed {read_count} identit{} ({failures} failed). saved-read ({}):",
+                    if read_count == 1 { "y" } else { "ies" },
                     opts.ecu
                 ),
             );
             for line in saved.lines() {
-                logln(&mut log, format!("  {line}"));
+                logln(log, format!("  {line}"));
             }
             if let Some(path) = &opts.out {
                 match std::fs::write(path, &saved) {
-                    Ok(()) => logln(&mut log, format!("wrote saved-read to {path}")),
-                    Err(e) => logln(&mut log, format!("could not write {path}: {e}")),
+                    Ok(()) => logln(log, format!("wrote saved-read to {path}")),
+                    Err(e) => logln(log, format!("could not write {path}: {e}")),
                 }
             }
         }
-        Err(e) => logln(&mut log, format!("could not assemble the saved-read: {e}")),
+        Err(e) => logln(log, format!("could not assemble the saved-read: {e}")),
     }
 
     logln(
-        &mut log,
+        log,
         "DONE. Reminder: this exchange is unproven on hardware; if the bytes above look \
          garbled, that is the data we iterate the VCX codecs from.",
     );
-    (0, log)
+    0
 }
 
-#[cfg(not(windows))]
-fn transmit(opts: &Opts, _confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String) {
-    // Unreachable from `run` off Windows (it routes to `dry_run`); kept so the symbol
-    // exists on every platform.
-    dry_run(opts, false)
+// ----- the staged, logged exchange (testable over any ByteSource) -------------------------
+
+/// The only services this command may ever transmit — both read-only: TesterPresent
+/// (`$3E`) and GMLAN ReadDataByIdentifier (`$1A`). The guard in [`frame_request`]
+/// refuses anything else, so `$27` or any write service can never reach the wire.
+const ALLOWED_SERVICES: [u8; 2] = [
+    udskit::testerpresent::TESTER_PRESENT,
+    crate::vcx::GM_READ_DATA_BY_IDENTIFIER,
+];
+
+/// Build the TesterPresent request (`$3E 00`): the keep-alive, read-nothing probe.
+fn build_tester_present() -> Vec<u8> {
+    udskit::testerpresent::build_request()
 }
 
-// ----- the staged, logged single-identity read (testable over any ByteSource) -------------
-
-/// Read one `$1A` identity over `source`, logging every stage's bytes.
+/// Frame a UDS request for the VCX send codec, refusing any service not in
+/// [`ALLOWED_SERVICES`].
 ///
-/// This drives the seam in stages — frame, exchange, unwrap envelope, parse — so the
-/// raw reply payload is logged before any parse can discard it: on a malformed or
-/// garbled reply the bytes are dumped, not swallowed. Returns the parsed
-/// [`IdentifierRead`](vcxtoolkit::modread::IdentifierRead), or the error (already
-/// logged) on failure.
-fn read_one_identity(
+/// This is the hard read-only gate: it is a runtime check (not a debug assert), so a
+/// release build cannot transmit a write or `$27` even if a future caller tried.
+///
+/// # Errors
+/// [`Error::Refused`] when `uds` is empty or its service id is not read-only;
+/// [`Error::from`] on a framing error.
+fn frame_request(uds: &[u8]) -> Result<Vec<u8>> {
+    let sid = uds.first().copied();
+    if !sid.is_some_and(|s| ALLOWED_SERVICES.contains(&s)) {
+        return Err(Error::Refused(format!(
+            "vcx-read refuses service {}: only read-only $3E and $1A may be transmitted",
+            sid.map_or_else(|| "(none)".to_string(), |s| format!("{s:#04X}"))
+        )));
+    }
+    Ok(frame_identity_request(uds)?)
+}
+
+/// Frame, exchange, and unwrap one request over `source`, logging every stage's bytes.
+///
+/// Drives the seam in stages — frame, exchange, unwrap envelope — so the raw reply
+/// payload is logged before any application parse can discard it: on a malformed or
+/// garbled reply the bytes are dumped, not swallowed. Returns the application PDU
+/// (ready for `udskit`), or the error (already logged).
+fn exchange_and_unwrap(
     source: &mut dyn ByteSource,
-    lid: u8,
+    uds: &[u8],
     log: &mut String,
-) -> Result<vcxtoolkit::modread::IdentifierRead> {
-    let (req, framed) = frame_lid(lid)?;
-    logln(log, format!("  -> UDS request (1A <lid>):  {}", hex(&req)));
+) -> Result<Vec<u8>> {
+    let framed = frame_request(uds)?;
+    logln(log, format!("  -> UDS request:             {}", hex(uds)));
     logln(
         log,
         format!("  -> framed VCX_PRO_Send PDU: {}", hex(&framed)),
@@ -301,19 +423,72 @@ fn read_one_identity(
         ),
     );
 
-    let app = match reply_application_bytes(&payload) {
-        Ok(a) => a,
+    match reply_application_bytes(&payload) {
+        Ok(app) => {
+            logln(log, format!("  <- application PDU:         {}", hex(app)));
+            Ok(app.to_vec())
+        }
         Err(e) => {
             logln(
                 log,
                 format!("  !! reply envelope malformed (raw bytes above): {e}"),
             );
-            return Err(e.into());
+            Err(e.into())
         }
-    };
-    logln(log, format!("  <- application PDU:         {}", hex(app)));
+    }
+}
 
-    match parse_identity_reply(app, lid) {
+/// Send TesterPresent (`$3E 00`) and confirm a positive `$7E` reply.
+///
+/// This is the safest real transmission: it reads no data and changes no state, so it
+/// is the first probe (via `--ping`) and the preflight before the `$1A` loop. On any
+/// non-positive answer the bytes are already dumped by [`exchange_and_unwrap`].
+///
+/// # Errors
+/// Transport/envelope errors from [`exchange_and_unwrap`]; [`Error::Negative`] on a
+/// `0x7F` answer; [`Error::Protocol`] when the positive response id is not `$7E`.
+fn tester_present(source: &mut dyn ByteSource, log: &mut String) -> Result<()> {
+    use udskit::message::{Response, decode_response};
+
+    let app = exchange_and_unwrap(source, &build_tester_present(), log)?;
+    match decode_response(&app)? {
+        Response::Positive(p) if p.response_sid == TESTER_PRESENT_POSITIVE_SID => {
+            logln(
+                log,
+                "  == TesterPresent OK (positive $7E) — the VCX pipe works.",
+            );
+            Ok(())
+        }
+        Response::Positive(p) => {
+            let e = Error::Protocol(format!(
+                "TesterPresent got response id {:#04X}, not $7E",
+                p.response_sid
+            ));
+            logln(log, format!("  !! {e}"));
+            Err(e)
+        }
+        Response::Negative(n) => {
+            let e = Error::Negative(n.describe());
+            logln(log, format!("  !! TesterPresent negative: {e}"));
+            Err(e)
+        }
+    }
+}
+
+/// The positive-response id for TesterPresent (`$3E | 0x40`).
+const TESTER_PRESENT_POSITIVE_SID: u8 = udskit::testerpresent::TESTER_PRESENT | 0x40;
+
+/// Read one `$1A` identity over `source`, logging every stage's bytes.
+///
+/// Returns the parsed [`IdentifierRead`](vcxtoolkit::modread::IdentifierRead), or the
+/// error (already logged) on failure.
+fn read_one_identity(
+    source: &mut dyn ByteSource,
+    lid: u8,
+    log: &mut String,
+) -> Result<vcxtoolkit::modread::IdentifierRead> {
+    let app = exchange_and_unwrap(source, &build_identity_request(lid), log)?;
+    match parse_identity_reply(&app, lid) {
         Ok(value) => {
             logln(
                 log,
@@ -331,36 +506,37 @@ fn read_one_identity(
     }
 }
 
-/// Build and frame the read request for one identifier.
+/// Build and frame one request for the dry-run display, returning `(uds, framed)`.
 ///
-/// `build_identity_request` is `udskit`'s `1A <lid>`; it is asserted to be a `$1A`
-/// read here so no other service can slip through this command.
-fn frame_lid(lid: u8) -> Result<(Vec<u8>, Vec<u8>)> {
-    let req = build_identity_request(lid);
-    // Read-only guard: this command only ever sends GMLAN $1A.
-    debug_assert_eq!(
-        req.first().copied(),
-        Some(crate::vcx::GM_READ_DATA_BY_IDENTIFIER)
-    );
-    let framed = frame_identity_request(&req)?;
-    Ok((req, framed))
+/// Routed through [`frame_request`], so the dry run shows exactly the bytes the live
+/// path would send and inherits the same read-only guard.
+fn frame_for_display(uds: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {
+    let framed = frame_request(&uds)?;
+    Ok((uds, framed))
 }
 
 // ----- shared report pieces ---------------------------------------------------------------
 
 fn header(log: &mut String, opts: &Opts, mode: &str) {
     logln(log, format!("gmdiag vcx-read — {mode}"));
-    logln(
-        log,
+    let scope = if opts.ping {
+        "TesterPresent $3E 00 only".to_string()
+    } else {
         format!(
-            "  port COM{}  ecu {}  lids {}  (READ-ONLY: $1A only, no $27, no writes)",
-            opts.port,
+            "ecu {}  lids {}",
             opts.ecu,
             opts.lids
                 .iter()
                 .map(|l| format!("{l:02X}"))
                 .collect::<Vec<_>>()
                 .join(" ")
+        )
+    };
+    logln(
+        log,
+        format!(
+            "  port COM{}  {scope}  (READ-ONLY: $3E/$1A only, no $27, no writes)",
+            opts.port
         ),
     );
 }
@@ -408,6 +584,7 @@ fn parse(args: &[String]) -> Result<Opts> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--owner-unhold" => opts.owner_unhold = true,
+            "--ping" => opts.ping = true,
             "--port" => {
                 opts.port = parse_port(next(&mut it, "--port")?)?;
                 port_set = true;
@@ -496,8 +673,10 @@ pub fn usage() -> String {
      USAGE: gmdiag vcx-read --port <N> [--owner-unhold] [options]\n\
      \n\
      \u{20}  --port <N>         COM number the doctor/detection layer found (COM4, com4, or 4)\n\
-     \u{20}  --owner-unhold     owner consent: open the dongle and TRANSMIT the $1A read\n\
-     \u{20}                     (without it, and off Windows, this is a dry run: nothing is sent)\n\
+     \u{20}  --owner-unhold     owner consent: open the dongle and TRANSMIT (without it, and\n\
+     \u{20}                     off Windows, this is a dry run: nothing is sent)\n\
+     \u{20}  --ping             send only TesterPresent ($3E 00) — the safest first probe:\n\
+     \u{20}                     proves the VCX pipe works before any data read\n\
      \u{20}  --lid <hex>        a $1A identifier to read (repeatable; default C1..CA, CB, CC)\n\
      \u{20}  --out <file>       write the assembled saved-read to <file>\n\
      \u{20}  --ecu <name>       saved-read controller name (metadata; default BECM)\n\
@@ -507,9 +686,11 @@ pub fn usage() -> String {
      \u{20}  --caller <hex>     VCX framing caller byte (default 00)\n\
      \u{20}  --timeout-ms <n>   per-step exchange timeout (default 2000)\n\
      \n\
-     Read-only: builds only GMLAN $1A, never $27, no write or actuation. Every stage\n\
-     prints hex (open frame, each Send PDU, raw reply). The live exchange is unproven\n\
-     on hardware; this command exists to drive it and fix the codecs from real bytes."
+     Read-only: builds only TesterPresent $3E and GMLAN $1A, never $27, no write or\n\
+     actuation. The full read runs a TesterPresent preflight first and stops if it is\n\
+     not positive. Every stage prints hex (open frame, each Send PDU, raw reply). The\n\
+     live exchange is unproven on hardware; this command exists to drive it and fix\n\
+     the codecs from real bytes."
         .to_string()
 }
 
@@ -531,6 +712,11 @@ mod tests {
         let mut app = vec![GM_IDENTITY_POSITIVE_SID, lid];
         app.extend_from_slice(value);
         reply_pdu(&app)
+    }
+
+    /// A positive TesterPresent reply: `$7E 00`.
+    fn tp_positive() -> Vec<u8> {
+        reply_pdu(&[TESTER_PRESENT_POSITIVE_SID, 0x00])
     }
 
     #[test]
@@ -571,18 +757,64 @@ mod tests {
     }
 
     #[test]
-    fn frame_lid_builds_only_1a_reads() {
-        // The read-only invariant: the request service is always $1A, never $27.
-        for lid in [0xC1u8, 0xCC, 0x03] {
-            let (req, framed) = frame_lid(lid).unwrap();
-            assert_eq!(req, vec![0x1A, lid]);
-            assert_ne!(
-                req[0], 0x27,
-                "a $1A read must never be a SecurityAccess $27"
-            );
-            // The framed Send PDU carries the two app bytes at offset 6.
-            assert_eq!(framed, vec![0, 0, 0, 0, 0, 2, 0x1A, lid]);
+    fn frame_request_allows_only_read_only_services() {
+        // $1A and $3E frame; the framed Send PDU carries the app bytes at offset 6.
+        assert_eq!(
+            frame_request(&[0x1A, 0xC1]).unwrap(),
+            vec![0, 0, 0, 0, 0, 2, 0x1A, 0xC1]
+        );
+        assert_eq!(
+            frame_request(&build_tester_present()).unwrap(),
+            vec![0, 0, 0, 0, 0, 2, 0x3E, 0x00]
+        );
+        // The guard is a hard runtime refusal: $27 SecurityAccess and $2E write and an
+        // empty request are all rejected before any byte could be framed.
+        for bad in [vec![0x27, 0x01], vec![0x2E, 0xC1, 0x00], Vec::new()] {
+            let err = frame_request(&bad).unwrap_err();
+            assert!(matches!(err, Error::Refused(_)), "{err:?}");
         }
+    }
+
+    #[test]
+    fn frame_for_display_routes_through_the_guard() {
+        // The dry-run display builder shows exactly the live bytes and inherits the guard.
+        let (uds, framed) = frame_for_display(build_identity_request(0xCC)).unwrap();
+        assert_eq!(uds, vec![0x1A, 0xCC]);
+        assert_eq!(framed, vec![0, 0, 0, 0, 0, 2, 0x1A, 0xCC]);
+        assert!(frame_for_display(vec![0x27, 0x01]).is_err());
+    }
+
+    #[test]
+    fn tester_present_confirms_a_positive_7e() {
+        let mut source = FakeByteSource::new(vec![tp_positive()]);
+        let mut log = String::new();
+        assert!(tester_present(&mut source, &mut log).is_ok());
+        assert!(log.contains("3E 00"), "the $3E 00 request is logged: {log}");
+        assert!(log.contains("raw reply payload"), "{log}");
+        assert!(log.contains("TesterPresent OK"), "{log}");
+        // The exact framed $3E 00 reached the seam.
+        assert_eq!(source.sent(), &[vec![0, 0, 0, 0, 0, 2, 0x3E, 0x00]]);
+    }
+
+    #[test]
+    fn tester_present_dumps_a_non_positive_answer() {
+        // A negative $7F to $3E: Err, and the raw bytes are dumped, not swallowed.
+        let mut source = FakeByteSource::new(vec![reply_pdu(&[0x7F, 0x3E, 0x11])]);
+        let mut log = String::new();
+        let err = tester_present(&mut source, &mut log).unwrap_err();
+        assert!(matches!(err, Error::Negative(_)), "{err:?}");
+        assert!(log.contains("7F 3E 11"), "raw reply must be dumped: {log}");
+        assert!(log.contains("TesterPresent negative"), "{log}");
+    }
+
+    #[test]
+    fn tester_present_refuses_a_wrong_positive_id() {
+        // A positive reply that is not $7E (here $5A) is refused with the bytes dumped.
+        let mut source = FakeByteSource::new(vec![reply_pdu(&[0x5A, 0x00])]);
+        let mut log = String::new();
+        let err = tester_present(&mut source, &mut log).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+        assert!(log.contains("5A 00"), "{log}");
     }
 
     #[test]
@@ -640,7 +872,8 @@ mod tests {
         assert_eq!(code, 0);
         assert!(text.contains("DRY RUN"), "{text}");
         assert!(text.contains("VCX_PRO_Open frame"), "{text}");
-        // Every default lid's framed request is present.
+        // The TesterPresent preflight is shown first, then every default lid.
+        assert!(text.contains("3E 00"), "preflight probe shown: {text}");
         assert!(text.contains("1A C1"), "{text}");
         assert!(text.contains("1A CC"), "{text}");
         assert!(text.contains("no port opened, no byte sent"), "{text}");
@@ -649,6 +882,19 @@ mod tests {
             !text.contains("27 "),
             "dry run must never frame a $27: {text}"
         );
+    }
+
+    #[test]
+    fn dry_run_ping_shows_only_tester_present() {
+        let opts = parse(&["--port".into(), "4".into(), "--ping".into()]).unwrap();
+        assert!(opts.ping);
+        let (code, text) = dry_run(&opts, true);
+        assert_eq!(code, 0);
+        // The $3E 00 probe is shown; no $1A identity request is.
+        assert!(text.contains("3E 00"), "{text}");
+        assert!(text.contains("TesterPresent $3E 00 only"), "{text}");
+        assert!(!text.contains("1A C1"), "ping shows no $1A read: {text}");
+        assert!(text.contains("the TesterPresent probe above"), "{text}");
     }
 
     #[test]
@@ -675,5 +921,36 @@ mod tests {
         let (code, text) = run(&["--owner-unhold".into()], &mut yes);
         assert_eq!(code, 2);
         assert!(text.contains("needs --port"), "{text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_identities_live_assembles_over_the_fake_serial() {
+        // The post-preflight $1A loop over two canned positive replies assembles and
+        // serializes the saved-read, exit code 0.
+        let mut source = FakeByteSource::new(vec![
+            positive(0xC1, &[0x00, 0x00, 0x00, 0x2A]),
+            positive(0xCC, &[0x56, 0x49, 0x4E]),
+        ]);
+        let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
+        opts.lids = vec![0xC1, 0xCC];
+        let mut log = String::new();
+        let code = read_identities_live(&mut source, &opts, &mut log);
+        assert_eq!(code, 0);
+        assert!(log.contains("lid C1 0000002A"), "{log}");
+        assert!(log.contains("lid CC 56494E"), "{log}");
+        assert!(log.contains("parsed 2 identities (0 failed)"), "{log}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_identities_live_reports_total_failure() {
+        // Every exchange fails (empty seam): exit code 1, with the byte-dump reminder.
+        let mut source = FakeByteSource::new(vec![]);
+        let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
+        opts.lids = vec![0xC1];
+        let mut log = String::new();
+        assert_eq!(read_identities_live(&mut source, &opts, &mut log), 1);
+        assert!(log.contains("no identities read"), "{log}");
     }
 }

@@ -29,9 +29,10 @@
 //! - [`vcx_read`] — the real-hardware, owner-gated, **read-only** `$1A` identity read command:
 //!   the one CLI path that transmits to a vehicle through the VCX-NANO. Without `--owner-unhold`
 //!   (and off Windows) it is a dry run that opens nothing and sends nothing; with it, on Windows,
-//!   it drives [`vcx_device::VcxByteSource`] and logs every byte. It
-//!   builds only GMLAN `$1A`, never `$27`, and reaches no write or actuation path. The live
-//!   exchange is unproven on hardware.
+//!   it drives [`vcx_device::VcxByteSource`] and logs every byte. The safest first transmission
+//!   is TesterPresent (`$3E 00`): `--ping` sends only that, and the full `$1A` read runs it as a
+//!   preflight and stops if it is not positive. It builds only `$3E` and `$1A`, never `$27`, and
+//!   reaches no write or actuation path. The live exchange is unproven on hardware.
 //! - [`cli`] — the read-first command line.
 //!
 //! # Boundaries

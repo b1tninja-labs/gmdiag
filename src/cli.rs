@@ -501,10 +501,11 @@ pub fn usage() -> String {
          \u{20}  catalog <what>         offline reference (services|routines|security|dids), no link\n\
          \n\
          VCX-NANO read (read-only, owner-gated; drives the dongle, not the TCP link):\n\
-         \u{20}  vcx-read --port <N> [--owner-unhold] [--lid <hex>] [--out <file>]\n\
-         \u{20}                        GMLAN $1A identity read over the VCX-NANO; dry-run without\n\
-         \u{20}                        --owner-unhold (opens nothing, sends nothing). $1A only,\n\
-         \u{20}                        never $27; logs every byte. Live exchange unproven on hardware.\n\
+         \u{20}  vcx-read --port <N> [--owner-unhold] [--ping] [--lid <hex>] [--out <file>]\n\
+         \u{20}                        GMLAN $1A identity read over the VCX-NANO (--ping: just the\n\
+         \u{20}                        TesterPresent $3E 00 probe). Dry-run without --owner-unhold\n\
+         \u{20}                        (opens nothing, sends nothing). $3E/$1A only, never $27;\n\
+         \u{20}                        logs every byte. Live exchange unproven on hardware.\n\
          \n\
          Gated commands (need the flag AND a confirmation):\n\
          \u{20}  write <did> <hex>      WriteDataByIdentifier 0x2E            [--write]\n\
