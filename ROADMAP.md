@@ -62,6 +62,13 @@ own, and gmdiag holds no key material. The legitimate route is `TechlinekitAutho
 delegates to the operator's authenticated Techline Connect / TDS subscription over a **process
 boundary** (techlinekit is Python; gmdiag is Rust, so no FFI) — not key-cracking.
 
+The TDS RE (2026-11-21) confirmed the broker mechanism: GM's SPS2 (`sps2.jar`) exposes a
+server-side seed→key service. The authenticated session POSTs `{seed, vin, algorithmNumber}` (an
+encrypted `SecureEndpoint` body) to `/sps/module-unlock/enc/{iecs|iecs/key-provisioning|isuzu}`
+under its `bearer` JWT and the server returns the `key`. gmdiag's `AuthKind::SecurityAccess` now
+carries those broker inputs (`vin`, `algorithm`). It stays `[open]`: techlinekit must still grow the
+broker subcommand and replicate SPS2's encryption envelope and per-module endpoint selection.
+
 | Status | Obligation | Anchor | Test |
 | --- | --- | --- | --- |
 | [ok] | The `Authorizer` seam governs actuation on top of `Arm`; the default `NoAuthorizer` grants nothing, so no request shape unlocks and gmdiag holds no key material | ISO 14229-1:2013 §9.4.1 (the key is "appropriate for the Seed received" — obtained, not derived) | `authorizer::tests::no_authorizer_grants_nothing_whatever_the_request` |
@@ -69,7 +76,7 @@ boundary** (techlinekit is Python; gmdiag is Rust, so no FFI) — not key-cracki
 | [ok] | Routine start/stop and device control each need `Arm::Actuate` AND an `AuthGrant`; results (`0x03`) stays a read | ISO 14229-1:2013 §9 (RoutineControl / InputOutputControl, via udskit) | `session::tests::routine_start_needs_actuate_and_authorization_but_results_is_a_read`; `session::tests::io_control_needs_actuate_and_authorization` |
 | [ok] | Coding/clearing carry no key material and stay on the `Arm` gate alone (an armed write reaches the bus) | — | `session::tests::coding_and_clearing_stay_on_the_arm_gate_only`; `fakeobd_live::writes_are_gated_locally_then_refused_by_the_simulator` |
 | [ok] | The `TechlinekitAuthorizer` stub resolves its entry point but brokers nothing yet (clearly marked) | — | `authorizer::tests::techlinekit_authorizer_is_a_clearly_marked_stub` |
-| [open] | `TechlinekitAuthorizer` brokers a real `AuthGrant` over a process boundary to the authenticated Techline Connect / TDS subscription (SPS entitlement / ALD challenge-signing / seed-key service) | techlinekit `sps`/`launch`; Techline Connect / TDS (not in primarysource) | none |
+| [open] | `TechlinekitAuthorizer` brokers a real `AuthGrant` over a process boundary: the TDS session returns the `0x27` key from GM's SPS2 seed→key service (`POST /sps/module-unlock/enc/*`, `{seed, vin, algorithmNumber}` → `key` under the TLC bearer). Blocked on techlinekit growing the broker subcommand + SecureEndpoint envelope + per-module endpoint mapping | SPS2 `sps2.jar` module-unlock clients; Techline Connect / TDS (not in primarysource) | none |
 
 ## CLI and fakeobd-first
 

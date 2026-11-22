@@ -34,11 +34,21 @@ pub enum AuthKind {
     /// A grant for this kind carries the `sendKey` key/response ([`AuthGrant::SecurityKey`]).
     /// ISO 14229-1:2013 §9.4.1: the client returns a key "appropriate for the Seed received";
     /// gmdiag must obtain that key from an authenticated source and never compute it.
+    ///
+    /// `vin` and `algorithm` are the broker inputs confirmed by the TDS RE: GM's server-side
+    /// module-unlock service (`SgmUnlockModuleModel`: `seed`, `seedSize`, `algorithmNumber`, `vin`
+    /// → `key`) computes the key from exactly these. They are optional here because the raw
+    /// `sendKey` primitive may not have them in hand; the unlock flow that reads the seed also knows
+    /// the vehicle's VIN and the module's `algorithmNumber` and fills them in.
     SecurityAccess {
         /// The requestSeed security level (an odd sub-function value).
         level: u8,
         /// The seed/challenge the server returned, when known; otherwise empty.
         seed: Vec<u8>,
+        /// The vehicle VIN the broker ties the unlock to, when known.
+        vin: Option<String>,
+        /// The module's `algorithmNumber` (GM's `algo_id`-indexed seed/key regime), when known.
+        algorithm: Option<u8>,
     },
     /// An SPS / programming or actuation step that needs a subscription entitlement: a
     /// RoutineControl start/stop, an InputOutputControl device-control, or a Service Programming
@@ -60,13 +70,36 @@ pub struct AuthRequest {
 
 impl AuthRequest {
     /// A SecurityAccess unlock request for `level` with the `seed` the server returned (pass an
-    /// empty slice when the live seed is not in hand).
+    /// empty slice when the live seed is not in hand). The broker inputs (`vin`, `algorithm`) are
+    /// left unset; use [`AuthRequest::security_access_brokered`] when they are known.
     #[must_use]
     pub fn security_access(level: u8, seed: &[u8]) -> Self {
         Self {
             kind: AuthKind::SecurityAccess {
                 level,
                 seed: seed.to_vec(),
+                vin: None,
+                algorithm: None,
+            },
+        }
+    }
+
+    /// A SecurityAccess unlock request carrying the full broker inputs the GM module-unlock service
+    /// needs: the requestSeed `level`, the `seed`, the vehicle `vin` and the module's `algorithm`
+    /// (`algorithmNumber`). The grant is the key the server returns for this seed.
+    #[must_use]
+    pub fn security_access_brokered(
+        level: u8,
+        seed: &[u8],
+        vin: impl Into<String>,
+        algorithm: u8,
+    ) -> Self {
+        Self {
+            kind: AuthKind::SecurityAccess {
+                level,
+                seed: seed.to_vec(),
+                vin: Some(vin.into()),
+                algorithm: Some(algorithm),
             },
         }
     }
@@ -189,13 +222,24 @@ pub const TECHLINEKIT_PROGRAM_ENV: &str = "GMDIAG_TECHLINEKIT";
 /// # Status: STUB
 ///
 /// The process-boundary mechanism and the [`AuthRequest`] / [`AuthGrant`] wire shapes are in place.
-/// The actual techlinekit call is a documented **TODO**: a separate investigation is reverse-
-/// engineering exactly what techlinekit can broker — an SPS entitlement, an ADIT ALD challenge-
-/// signing call, or a seed/key service (techlinekit exposes `sps --vin` and `launch --slot`
-/// subcommands today). Until those findings land, [`TechlinekitAuthorizer::authorize`] spawns
-/// nothing and returns [`AuthError::Broker`] with a clear stub message. gmdiag's boundary is
-/// unchanged in the meantime: with this authorizer a gated op is still refused, just with a
-/// "stub" reason rather than "unauthorized".
+/// The actual techlinekit call is a documented **TODO**. The TDS RE (2026-11-21) confirmed the
+/// concrete mechanism: GM's SPS2 (`sps2.jar`) carries a server-side module-unlock / seed→key
+/// service. The authenticated Techline Connect / TDS session brokers on-vehicle SecurityAccess by
+/// POSTing `{seed, vin, algorithmNumber}` (an encrypted `SecureEndpoint` body) to
+/// `/sps/module-unlock/enc/{iecs | iecs/key-provisioning | isuzu}` on the TLC gateway under the
+/// session's `Authorization: bearer <JWT>`, and the server returns the `key`. So the flow is:
+/// gmdiag does its own `27 01` requestSeed on the bus, hands `{seed, vin, algorithmNumber}` to
+/// techlinekit, techlinekit returns the key, and gmdiag sends `27 02` — the key is **obtained**
+/// from the subscription, never derived.
+///
+/// Two pieces are not gmdiag's to build and are not done yet, which is why this stays a stub:
+/// techlinekit must grow the broker subcommand itself, and it must replicate SPS2's
+/// `SecureEndpoint` encryption envelope and the per-module endpoint selection (the exact endpoint
+/// for the GMG3 head unit's ADIT ALD challenge is still inference, not proven). Until techlinekit
+/// exposes that, [`TechlinekitAuthorizer::authorize`] spawns nothing and returns
+/// [`AuthError::Broker`] with a clear stub message. gmdiag's boundary is unchanged in the meantime:
+/// with this authorizer a gated op is still refused, just with a "stub" reason rather than
+/// "unauthorized".
 #[derive(Clone, Debug)]
 pub struct TechlinekitAuthorizer {
     program: OsString,
@@ -226,19 +270,21 @@ impl Default for TechlinekitAuthorizer {
 
 impl Authorizer for TechlinekitAuthorizer {
     fn authorize(&self, request: &AuthRequest) -> Result<AuthGrant, AuthError> {
-        // STUB (see the type documentation). The real call will cross the process boundary:
+        // STUB (see the type documentation). The real call will cross the process boundary, e.g.:
         //
-        //   <program> -m techlinekit <authorize-subcommand> [request fields on argv / stdin]
+        //   <program> -m techlinekit unlock --vin <vin> --algo <algorithmNumber> --seed <hex>
         //
-        // then read an AuthGrant back from techlinekit's stdout (the wire shapes above) and return
-        // it — exactly the spirit of `crate::spawn` driving the `fakeobd` binary. Which subcommand,
-        // and what it can broker (SPS entitlement / ALD challenge-signing / a seed-key service), is
-        // being reverse-engineered separately.
+        // techlinekit POSTs {seed, vin, algorithmNumber} (encrypted SecureEndpoint body) to
+        // /sps/module-unlock/enc/* under the authenticated TLC session bearer and prints the key;
+        // this reads that AuthGrant::SecurityKey back from stdout and returns it — the spirit of
+        // `crate::spawn` driving the `fakeobd` binary. The mechanism is confirmed (TDS RE); what is
+        // not yet built, and keeps this a stub, is techlinekit's broker subcommand plus its
+        // SecureEndpoint encryption envelope and per-module endpoint selection.
         //
-        // TODO(techlinekit-TDS-API): replace this body with the real subprocess call once the TDS
-        // authorization interface is known. gmdiag must still never hold a key or a token — it
-        // forwards only what techlinekit returns. `self.program` is the entry point that call will
-        // spawn; it is resolved here so the wiring is already in place.
+        // TODO(techlinekit-TDS-API): replace this body with the real subprocess call once
+        // techlinekit exposes the broker subcommand. gmdiag must still never hold a key or a token —
+        // it forwards only what techlinekit returns. `self.program` is the entry point that call
+        // will spawn; it is resolved here so the wiring is already in place.
         let via = self.program.to_string_lossy();
         Err(AuthError::Broker(format!(
             "TechlinekitAuthorizer is a stub: {} would be brokered by techlinekit over a process \
@@ -313,6 +359,34 @@ mod tests {
         let a = TechlinekitAuthorizer::default();
         let prog = a.program().to_string_lossy();
         assert!(!prog.is_empty());
+    }
+
+    #[test]
+    fn security_access_carries_the_broker_inputs_when_known() {
+        // The plain constructor leaves the broker inputs unset (the raw sendKey primitive).
+        let AuthKind::SecurityAccess { vin, algorithm, .. } =
+            AuthRequest::security_access(0x01, &[0xAA]).kind
+        else {
+            panic!("expected a SecurityAccess request");
+        };
+        assert!(vin.is_none() && algorithm.is_none());
+
+        // The brokered constructor carries {seed, vin, algorithmNumber} — exactly GM's
+        // SgmUnlockModuleModel inputs confirmed by the TDS RE.
+        let AuthKind::SecurityAccess {
+            level,
+            seed,
+            vin,
+            algorithm,
+        } = AuthRequest::security_access_brokered(0x01, &[0xAA, 0xBB], "1G1FZ6S0XKUF00000", 0x07)
+            .kind
+        else {
+            panic!("expected a SecurityAccess request");
+        };
+        assert_eq!(level, 0x01);
+        assert_eq!(seed, vec![0xAA, 0xBB]);
+        assert_eq!(vin.as_deref(), Some("1G1FZ6S0XKUF00000"));
+        assert_eq!(algorithm, Some(0x07));
     }
 
     #[test]
