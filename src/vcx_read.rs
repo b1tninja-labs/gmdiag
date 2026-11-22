@@ -33,9 +33,17 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::vcx::{ByteSource, DEFAULT_IDENTITY_LIDS, build_identity_request, parse_identity_reply};
-use vcxtoolkit::collect::{ISO15765_PROTOCOL, frame_identity_request, reply_application_bytes};
+use crate::vcx::{DEFAULT_IDENTITY_LIDS, build_identity_request};
+use vcxtoolkit::collect::{ISO15765_PROTOCOL, frame_identity_request};
 use vcxtoolkit::{Command, open_code, open_payload, pack, pro_send_header};
+
+// The byte seam (open the dongle and exchange) is driven only by the Windows
+// live-transmit path and by the tests. On a non-Windows, non-test build these would be
+// unused, so they are gated together with their users (`#[cfg(any(windows, test))]`).
+#[cfg(any(windows, test))]
+use crate::vcx::{ByteSource, parse_identity_reply};
+#[cfg(any(windows, test))]
+use vcxtoolkit::collect::reply_application_bytes;
 
 /// The default exchange timeout (mirrors `vcx_device::DEFAULT_EXCHANGE_TIMEOUT`).
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
@@ -402,6 +410,7 @@ fn frame_request(uds: &[u8]) -> Result<Vec<u8>> {
 /// payload is logged before any application parse can discard it: on a malformed or
 /// garbled reply the bytes are dumped, not swallowed. Returns the application PDU
 /// (ready for `udskit`), or the error (already logged).
+#[cfg(any(windows, test))]
 fn exchange_and_unwrap(
     source: &mut dyn ByteSource,
     uds: &[u8],
@@ -455,6 +464,7 @@ fn exchange_and_unwrap(
 /// ([`read_identities_live`]) — which **requires** a `PipeProven` — is structurally
 /// unreachable until the probe has come back positive. A future caller cannot forget
 /// the preflight; the type system forbids skipping it.
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy)]
 #[must_use]
 struct PipeProven(());
@@ -470,6 +480,7 @@ struct PipeProven(());
 /// # Errors
 /// Transport/envelope errors from [`exchange_and_unwrap`]; [`Error::Negative`] on a
 /// `0x7F` answer; [`Error::Protocol`] when the positive response id is not `$7E`.
+#[cfg(any(windows, test))]
 fn tester_present(source: &mut dyn ByteSource, log: &mut String) -> Result<PipeProven> {
     use udskit::message::{Response, decode_response};
 
@@ -499,12 +510,14 @@ fn tester_present(source: &mut dyn ByteSource, log: &mut String) -> Result<PipeP
 }
 
 /// The positive-response id for TesterPresent (`$3E | 0x40`).
+#[cfg(any(windows, test))]
 const TESTER_PRESENT_POSITIVE_SID: u8 = udskit::testerpresent::TESTER_PRESENT | 0x40;
 
 /// Read one `$1A` identity over `source`, logging every stage's bytes.
 ///
 /// Returns the parsed [`IdentifierRead`](vcxtoolkit::modread::IdentifierRead), or the
 /// error (already logged) on failure.
+#[cfg(any(windows, test))]
 fn read_one_identity(
     source: &mut dyn ByteSource,
     lid: u8,
