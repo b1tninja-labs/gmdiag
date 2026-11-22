@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::vcx::{DEFAULT_IDENTITY_LIDS, build_identity_request};
-use vcxtoolkit::collect::{ISO15765_PROTOCOL, frame_identity_request};
+use vcxtoolkit::collect::{
+    ISO15765_FRAME_PAD, ISO15765_PROTOCOL, frame_identity_request_with_flags,
+};
 use vcxtoolkit::{Command, open_code, open_payload, pack, pro_send_header};
 
 // The byte seam (open the dongle and exchange) is driven only by the Windows
@@ -417,7 +419,9 @@ fn frame_request(uds: &[u8], req_id: u16) -> Result<(Vec<u8>, Vec<u8>)> {
         )));
     }
     let payload = raw_mode_payload(req_id, uds);
-    let framed = frame_identity_request(&payload)?;
+    // Pad the ISO 15765 single frame to 8 bytes (VCX PDU flag 0x200, the recovered
+    // ISO15765_FRAME_PAD): GM ECUs ignore an unpadded single frame.
+    let framed = frame_identity_request_with_flags(ISO15765_FRAME_PAD, &payload)?;
     Ok((payload, framed))
 }
 
@@ -814,12 +818,13 @@ mod tests {
         rx_reply(&[TESTER_PRESENT_POSITIVE_SID, 0x00])
     }
 
-    /// The framed Send PDU for a raw-mode request to [`TX`]: flags(0) + len + the
-    /// 4-byte tx id + `uds`.
+    /// The framed Send PDU for a raw-mode request to [`TX`]: flags(0x200, the ISO
+    /// 15765 frame-pad) + len + the 4-byte tx id + `uds`.
     fn framed_to_tx(uds: &[u8]) -> Vec<u8> {
         let mut payload = u32::from(TX).to_be_bytes().to_vec();
         payload.extend_from_slice(uds);
-        let mut framed = vec![0, 0, 0, 0];
+        // VCX PDU flags, big-endian: 0x00000200 = ISO15765_FRAME_PAD.
+        let mut framed = vec![0, 0, 0x02, 0];
         framed.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
         framed.extend_from_slice(&payload);
         framed
