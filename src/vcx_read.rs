@@ -14,12 +14,12 @@
 //!   data and changes no state. `--ping` sends only that (the "does the pipe work at
 //!   all?" test); the full `$1A` read runs a TesterPresent **preflight** first and
 //!   stops, dumping the bytes, if it does not come back positive.
-//! - **Owner-gated.** Without `--owner-unhold` it is a **dry run**: it builds and
-//!   prints the framed request bytes and the channel-open plan, opens nothing, and
-//!   sends nothing. Only with `--owner-unhold` (and a `y` at the confirmation) does
-//!   it open the dongle and transmit. The real transmit is Windows-only
-//!   (`#[cfg(windows)]`, like [`VcxByteSource::open`](crate::vcx_device::VcxByteSource));
-//!   off Windows, or without the flag, it stays a dry run.
+//! - **Transmits by default.** On Windows with a port it opens the dongle and
+//!   transmits. `--print-only` makes it a **dry run**: it builds and prints the framed
+//!   request bytes and the channel-open plan, opens nothing, and sends nothing. The
+//!   real transmit is Windows-only (`#[cfg(windows)]`, like
+//!   [`VcxByteSource::open`](crate::vcx_device::VcxByteSource)); off Windows, or with
+//!   `--print-only`, it stays a dry run.
 //! - **Loud.** Every stage prints hex: the reconstructed `VCX_PRO_Open` frame, the
 //!   `VCX_PRO_Send` header template, each framed `$1A` Send PDU, and the raw reply
 //!   payload. On a malformed or garbled reply it dumps whatever bytes came back
@@ -53,8 +53,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 2000;
 struct Opts {
     /// The COM port number the detection layer found (never hardcoded).
     port: u32,
-    /// Explicit owner consent: without it this is a dry run that transmits nothing.
-    owner_unhold: bool,
+    /// Opt out of transmitting: build and print the framed bytes and plan, open
+    /// nothing, send nothing. Default is to transmit (Windows + a port).
+    print_only: bool,
     /// TesterPresent-only mode: transmit just `$3E 00` and stop (the "does the pipe
     /// work at all?" probe). Skips the `$1A` identity loop entirely.
     ping: bool,
@@ -82,7 +83,7 @@ impl Default for Opts {
     fn default() -> Self {
         Self {
             port: 0,
-            owner_unhold: false,
+            print_only: false,
             ping: false,
             lids: DEFAULT_IDENTITY_LIDS.to_vec(),
             out: None,
@@ -98,21 +99,24 @@ impl Default for Opts {
 
 /// Run `vcx-read`. Returns `(exit_code, text)`, like [`crate::cli::run`].
 ///
-/// `confirm` is asked once, before any byte is transmitted, with a one-line
-/// description of the read. A dry run never calls it.
+/// Transmits by default on Windows with a port. `--print-only` (or any non-Windows
+/// platform) makes it a dry run that opens nothing and sends nothing. The read stays
+/// read-only: only `$3E`/`$1A` are ever built (the [`frame_request`] guard), and the
+/// `$1A` loop is still blocked behind a positive TesterPresent ([`PipeProven`]).
 #[must_use]
-pub fn run(args: &[String], confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String) {
+pub fn run(args: &[String]) -> (i32, String) {
     let opts = match parse(args) {
         Ok(o) => o,
         Err(e) => return (2, format!("{e}\n\n{}", usage())),
     };
 
-    // The real transmit is Windows-only; off Windows we stay a dry run with a note.
+    // The real transmit is Windows-only; off Windows, or with --print-only, it is a
+    // dry run with a note.
     let can_transmit = cfg!(windows);
-    if opts.owner_unhold && can_transmit {
-        transmit(&opts, confirm)
-    } else {
+    if opts.print_only || !can_transmit {
         dry_run(&opts, can_transmit)
+    } else {
+        transmit(&opts)
     }
 }
 
@@ -182,11 +186,10 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
     }
 
     logln(&mut log, "");
-    if opts.owner_unhold && !can_transmit {
+    if !opts.print_only && !can_transmit {
         logln(
             &mut log,
-            "NOTE: --owner-unhold was given, but the real VCX transmit is Windows-only; \
-             staying a dry run on this platform.",
+            "NOTE: the real VCX transmit is Windows-only; staying a dry run on this platform.",
         );
     }
     let what = if opts.ping {
@@ -194,11 +197,16 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
     } else {
         "the TesterPresent preflight then the $1A read above"
     };
+    let how = if opts.print_only {
+        "drop --print-only"
+    } else {
+        "run on Windows"
+    };
     logln(
         &mut log,
         format!(
-            "DRY RUN COMPLETE: no port opened, no byte sent. Re-run with --owner-unhold on \
-             Windows to open the dongle and transmit {what}."
+            "DRY RUN COMPLETE: no port opened, no byte sent. {how} to open the dongle and \
+             transmit {what}."
         ),
     );
     (0, log)
@@ -207,40 +215,19 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
 // ----- the real transmit (Windows-only) ---------------------------------------------------
 
 #[cfg(windows)]
-fn transmit(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String) {
+fn transmit(opts: &Opts) -> (i32, String) {
     use crate::vcx_device::VcxByteSource;
 
     let mut log = String::new();
     let mode = if opts.ping {
-        "LIVE TesterPresent PROBE (owner-unhold)"
+        "LIVE TesterPresent PROBE"
     } else {
-        "LIVE READ (owner-unhold)"
+        "LIVE READ"
     };
     header(&mut log, opts, mode);
     match open_plan_lines(opts) {
         Ok(lines) => log.push_str(&lines),
         Err(e) => return (1, format!("{log}\nerror building open plan: {e}")),
-    }
-
-    let prompt = if opts.ping {
-        format!(
-            "VCX TesterPresent probe ($3E 00) on COM{} — READ-ONLY (reads nothing, no $27, no writes)",
-            opts.port
-        )
-    } else {
-        format!(
-            "VCX $1A identity READ on COM{} — READ-ONLY (TesterPresent preflight + {} identifiers, no $27, no writes)",
-            opts.port,
-            opts.lids.len()
-        )
-    };
-    if !confirm(&prompt) {
-        logln(&mut log, "");
-        logln(
-            &mut log,
-            "refused: owner consent prompt declined; nothing opened, nothing sent.",
-        );
-        return (1, log);
     }
 
     logln(&mut log, "");
@@ -297,7 +284,7 @@ fn transmit(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String)
 }
 
 #[cfg(not(windows))]
-fn transmit(opts: &Opts, _confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String) {
+fn transmit(opts: &Opts) -> (i32, String) {
     // Unreachable from `run` off Windows (it routes to `dry_run`); kept so the symbol
     // exists on every platform.
     dry_run(opts, false)
@@ -675,7 +662,7 @@ fn parse(args: &[String]) -> Result<Opts> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--owner-unhold" => opts.owner_unhold = true,
+            "--print-only" => opts.print_only = true,
             "--ping" => opts.ping = true,
             "--port" => {
                 opts.port = parse_port(next(&mut it, "--port")?)?;
@@ -760,13 +747,13 @@ fn logln(log: &mut String, line: impl AsRef<str>) {
 /// The `vcx-read` usage block, folded into the CLI's help.
 #[must_use]
 pub fn usage() -> String {
-    "gmdiag vcx-read — real VCX-NANO $1A identity read (READ-ONLY, owner-gated).\n\
+    "gmdiag vcx-read — real VCX-NANO $1A identity read (READ-ONLY).\n\
      \n\
-     USAGE: gmdiag vcx-read --port <N> [--owner-unhold] [options]\n\
+     USAGE: gmdiag vcx-read --port <N> [options]   (transmits by default on Windows)\n\
      \n\
      \u{20}  --port <N>         COM number the doctor/detection layer found (COM4, com4, or 4)\n\
-     \u{20}  --owner-unhold     owner consent: open the dongle and TRANSMIT (without it, and\n\
-     \u{20}                     off Windows, this is a dry run: nothing is sent)\n\
+     \u{20}  --print-only       dry run: build and print the framed bytes and plan, send nothing\n\
+     \u{20}                     (also the default off Windows, where the transmit is unavailable)\n\
      \u{20}  --ping             send only TesterPresent ($3E 00) — the safest first probe:\n\
      \u{20}                     proves the VCX pipe works before any data read\n\
      \u{20}  --lid <hex>        a $1A identifier to read (repeatable; default C1..CA, CB, CC)\n\
@@ -837,10 +824,10 @@ mod tests {
     #[test]
     fn parse_requires_a_port() {
         assert!(parse(&[]).is_err());
-        assert!(parse(&["--owner-unhold".into()]).is_err());
+        assert!(parse(&["--print-only".into()]).is_err());
         let o = parse(&["--port".into(), "4".into()]).unwrap();
         assert_eq!(o.port, 4);
-        assert!(!o.owner_unhold);
+        assert!(!o.print_only);
         assert_eq!(o.lids, DEFAULT_IDENTITY_LIDS.to_vec());
     }
 
@@ -853,7 +840,7 @@ mod tests {
         let o = parse(&[
             "--port".into(),
             "COM7".into(),
-            "--owner-unhold".into(),
+            "--print-only".into(),
             "--lid".into(),
             "C1".into(),
             "--lid".into(),
@@ -865,7 +852,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(o.port, 7);
-        assert!(o.owner_unhold);
+        assert!(o.print_only);
         assert_eq!(o.lids, vec![0xC1, 0xCC]);
         assert_eq!(o.out.as_deref(), Some("r.txt"));
         assert_eq!(o.ecu, "EBCM");
@@ -1021,9 +1008,10 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_notes_when_owner_unhold_cannot_transmit() {
-        // owner_unhold set but the platform cannot transmit: still a dry run, with a note.
-        let mut opts = parse(&["--port".into(), "4".into(), "--owner-unhold".into()]).unwrap();
+    fn dry_run_notes_when_the_platform_cannot_transmit() {
+        // Default (not --print-only) but the platform cannot transmit: still a dry run,
+        // with a Windows-only note.
+        let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
         opts.lids = vec![0xC1];
         let (code, text) = dry_run(&opts, false);
         assert_eq!(code, 0);
@@ -1031,17 +1019,16 @@ mod tests {
     }
 
     #[test]
-    fn run_without_owner_unhold_is_a_dry_run() {
-        let mut no = |_: &str| false;
-        let (code, text) = run(&["--port".into(), "4".into()], &mut no);
+    fn run_print_only_is_a_dry_run() {
+        // --print-only forces a dry run on every platform (so the test never transmits).
+        let (code, text) = run(&["--port".into(), "4".into(), "--print-only".into()]);
         assert_eq!(code, 0);
         assert!(text.contains("DRY RUN"), "{text}");
     }
 
     #[test]
     fn run_rejects_a_missing_port() {
-        let mut yes = |_: &str| true;
-        let (code, text) = run(&["--owner-unhold".into()], &mut yes);
+        let (code, text) = run(&["--print-only".into()]);
         assert_eq!(code, 2);
         assert!(text.contains("needs --port"), "{text}");
     }
