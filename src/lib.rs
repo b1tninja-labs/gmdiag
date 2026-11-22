@@ -20,8 +20,12 @@
 //! - [`spawn`] — spawns `fakeobd` for the fakeobd-first dry-run and the tests.
 //! - [`vcx`] — an offline [`Transport`](transport::Transport) adapter that carries GMLAN `$1A`
 //!   identity reads over `vcxtoolkit`'s recovered frame codecs and assembles them into a
-//!   `vcxtoolkit::modread` saved read. Driven only by an in-process fake; the hardware byte
-//!   seam is out of scope and stays gated (`vcxtoolkit::collect::vehicle_read_gate`).
+//!   `vcxtoolkit::modread` saved read. Its byte seam is injected; it ships an in-process fake.
+//! - [`vcx_device`] — the real hardware [`ByteSource`](vcx::ByteSource) for that seam: it drives
+//!   `vcxtoolkit`'s channel-open plus Send/Recv exchange over a USB serial port, opened on the
+//!   detection-selected COM number (never hardcoded). The seam logic is tested over a fake serial;
+//!   the live vehicle read stays held behind `vcxtoolkit::collect::vehicle_read_gate` and is reached
+//!   only by an `#[ignore]`d, owner-gated hardware test.
 //! - [`cli`] — the read-first command line.
 //!
 //! # Boundaries
@@ -37,6 +41,7 @@ pub mod session;
 pub mod spawn;
 pub mod transport;
 pub mod vcx;
+pub mod vcx_device;
 
 pub use error::{Error, Result};
 
