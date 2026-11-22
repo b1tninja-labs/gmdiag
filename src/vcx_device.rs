@@ -42,7 +42,7 @@
 use std::time::Duration;
 
 use vcxtoolkit::collect::ISO15765_PROTOCOL;
-use vcxtoolkit::{Channel, DeviceError, SerialPort};
+use vcxtoolkit::{Channel, SerialPort};
 
 use crate::error::{Error, Result};
 use crate::vcx::ByteSource;
@@ -197,23 +197,6 @@ impl VcxByteSource<vcxtoolkit::Port> {
     }
 }
 
-/// Map a `vcxtoolkit` device error into the crate error.
-///
-/// A port failure or timeout (open or send) is an [`Error::Io`] — the link did not
-/// deliver. A wrong echo, a refusal, or an unresolved protocol is an
-/// [`Error::Protocol`] — the device answered, but not as the exchange requires. A
-/// *negative* `$1A` response is **not** here: it arrives inside the reply envelope
-/// and surfaces when `udskit` parses the application PDU.
-fn map_device_error<E: std::fmt::Display>(error: &DeviceError<E>) -> Error {
-    let message = error.to_string();
-    match error {
-        DeviceError::Open(_) | DeviceError::Send(_) => Error::Io(std::io::Error::other(message)),
-        DeviceError::Protocol(_) | DeviceError::WrongEcho { .. } | DeviceError::Refused => {
-            Error::Protocol(format!("vcx device: {message}"))
-        }
-    }
-}
-
 /// Map a `forward` builder refusal (a payload that could not be built) into the
 /// crate error. These are construction errors, not link failures, so they are a
 /// [`Error::Protocol`].
@@ -221,23 +204,68 @@ fn forward_err(error: vcxtoolkit::ForwardError) -> Error {
     Error::Protocol(format!("vcx connect: {error}"))
 }
 
-/// Write one VCX command over the port and read its reply frame (the dongle's ack).
-fn send_command<S: SerialPort>(
+/// Write one VCX command (`label` names it for diagnostics), then read the dongle's
+/// reply frame and return its payload.
+///
+/// Unlike a plain `exchange_with`, a timeout here reports **which** command had no
+/// reply and dumps the raw bytes the dongle sent (if any), so an on-car bring-up
+/// failure pins the exact step instead of a bare "no complete frame".
+fn command_step<S: SerialPort>(
     port: &S,
+    label: &str,
     header: [u8; 4],
     payload: &[u8],
     timeout: Duration,
-) -> Result<vcxtoolkit::Frame>
+) -> Result<Vec<u8>>
 where
     S::Error: std::fmt::Display,
 {
-    vcxtoolkit::exchange_with(
-        port,
-        header,
-        payload,
-        &mut vcxtoolkit::Deadline::new(timeout),
-    )
-    .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))
+    let frame = vcxtoolkit::pack(header, payload)
+        .map_err(|error| Error::Protocol(format!("{label}: pack: {error}")))?;
+    let mut written = 0;
+    while written < frame.len() {
+        match port.write(&frame[written..]) {
+            Ok(0) => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "{label}: write stalled at {written}/{}",
+                    frame.len()
+                ))));
+            }
+            Ok(n) => written += n,
+            Err(error) => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "{label}: write: {error}"
+                ))));
+            }
+        }
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        match port.read(&mut chunk) {
+            Ok(0) => {}
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(frame) = first_complete_frame(&buf) {
+                    return Ok(frame.payload);
+                }
+            }
+            Err(error) => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "{label}: read: {error}"
+                ))));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Protocol(format!(
+                "{label}: no reply frame in {} ms (raw bytes from dongle: {buf:02X?})",
+                timeout.as_millis(),
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// Bring the ISO 15765 channel up on the dongle: the recovered `PassThruConnect`
@@ -263,14 +291,25 @@ where
     };
     let ch = channel.channel;
 
-    // 1. Open the ISO 15765 data channel (the reply must echo VCX_PRO_Open).
-    channel
-        .open(port, timeout)
-        .map_err(|error| map_device_error(&error))?;
+    // 1. Open the ISO 15765 data channel (the reply must echo VCX_PRO_Open). A
+    //    failure here is labelled so the step is unambiguous on hardware.
+    channel.open(port, timeout).map_err(|error| match &error {
+        // A link timeout/port failure stays Io; a wrong echo or refusal is Protocol.
+        vcxtoolkit::DeviceError::Open(_) | vcxtoolkit::DeviceError::Send(_) => Error::Io(
+            std::io::Error::other(format!("bring-up VCX_PRO_Open (0x40): {error}")),
+        ),
+        _ => Error::Protocol(format!("bring-up VCX_PRO_Open (0x40): {error}")),
+    })?;
 
     // 2. SetComParam: the CAN baud, the recovered PassThruConnect SetComParam record.
     let com = set_com_param(&[baud_record(DEFAULT_CAN_BAUD)]).map_err(forward_err)?;
-    send_command(port, Command::ProSetComParam.header(ch), &com, timeout)?;
+    command_step(
+        port,
+        "bring-up SetComParam (0x45)",
+        Command::ProSetComParam.header(ch),
+        &com,
+        timeout,
+    )?;
 
     // 3. AddFilter: the ISO 15765 flow-control filter. Skipped when no ids are set
     //    (the bare open+send path the offline tests drive).
@@ -288,12 +327,19 @@ where
         })
         .map_err(forward_err)?;
         let payload = add_filter(&[filter]).map_err(forward_err)?;
-        send_command(port, Command::ProAddFilter.header(ch), &payload, timeout)?;
+        command_step(
+            port,
+            "bring-up AddFilter (0x48)",
+            Command::ProAddFilter.header(ch),
+            &payload,
+            timeout,
+        )?;
     }
 
     // 4. Start the channel.
-    send_command(
+    command_step(
         port,
+        "bring-up ProStart (0x42)",
         Command::ProStart.header(ch),
         &start_payload(),
         timeout,
@@ -375,8 +421,9 @@ where
         // Send the caller's already-framed VCX_PRO_Send request. The Send reply is
         // only the dongle's 1-byte status ack (0x9B is normal); the ECU reply is
         // pushed on the serial as a separate frame after the ack.
-        let _ack = send_command(
+        let _ack = command_step(
             &self.port,
+            "VCX_PRO_Send",
             vcxtoolkit::pro_send_header(self.channel.caller, self.channel.channel),
             framed_request,
             self.timeout,
@@ -592,8 +639,8 @@ mod tests {
         ]);
         let error = seam.exchange(&[0, 0, 0, 0, 0, 2, 0x1A, 0xC1]).unwrap_err();
         assert!(matches!(error, crate::Error::Protocol(_)), "{error:?}");
-        assert!(error.to_string().contains("vcx device"), "{error}");
-        // Only the open was written; no request frame followed the refusal.
+        assert!(error.to_string().contains("VCX_PRO_Open"), "{error}");
+        // Only the open was written; no config or request frame followed the refusal.
         assert_eq!(seam.port().writes.borrow().len(), 1);
     }
 
