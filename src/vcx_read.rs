@@ -61,6 +61,10 @@ struct Opts {
     /// TesterPresent-only mode: transmit just `$3E 00` and stop (the "does the pipe
     /// work at all?" probe). Skips the `$1A` identity loop entirely.
     ping: bool,
+    /// Simulation mode: drive the whole read over an in-process fake dongle (no
+    /// hardware), which returns a positive `$7E`/`$5A` for every request. Proves the
+    /// reader's bring-up/send/recv/parse path end to end on any platform.
+    simulate: bool,
     /// The `$1A` identifiers to read, in order.
     lids: Vec<u8>,
     /// Where to write the assembled saved-read, if anywhere.
@@ -87,6 +91,7 @@ impl Default for Opts {
             port: 0,
             print_only: false,
             ping: false,
+            simulate: false,
             lids: DEFAULT_IDENTITY_LIDS.to_vec(),
             out: None,
             ecu: "BECM".to_string(),
@@ -112,6 +117,12 @@ pub fn run(args: &[String]) -> (i32, String) {
         Err(e) => return (2, format!("{e}\n\n{}", usage())),
     };
 
+    // --simulate drives the whole read over an in-process fake dongle (no hardware),
+    // so the bring-up, send, pushed-reply read and parse can be exercised anywhere.
+    if opts.simulate {
+        return simulate(&opts);
+    }
+
     // The real transmit is Windows-only; off Windows, or with --print-only, it is a
     // dry run with a note.
     let can_transmit = cfg!(windows);
@@ -120,6 +131,171 @@ pub fn run(args: &[String]) -> (i32, String) {
     } else {
         transmit(&opts)
     }
+}
+
+/// A fake VCX dongle at the SERIAL level for `--simulate`.
+///
+/// It speaks the real `0xBB` VCX frame protocol: it parses each frame the driver writes
+/// and queues the reply a dongle would — an ack echoing each bring-up command, and for a
+/// `VCX_PRO_Send` a `0x9B` status ack followed by the pushed ECU reply frame. Driving the
+/// real [`VcxByteSource`](crate::vcx_device::VcxByteSource) over it therefore exercises
+/// the actual native transport (channel bring-up, frame pack/unpack, the pushed-reply
+/// read) — the exact code that runs on the car — against canned responses.
+struct SimSerial {
+    /// The responder CAN id prefixed on each reply, as a real ECU reply carries.
+    resp_id: u16,
+    /// Bytes queued to hand back on the next `read` (reply frames, already `0xBB`-packed).
+    queue: std::cell::RefCell<std::collections::VecDeque<u8>>,
+}
+
+impl SimSerial {
+    fn new(resp_id: u16) -> Self {
+        Self {
+            resp_id,
+            queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+}
+
+/// The error type for [`SimSerial`]; it never fails in practice.
+#[derive(Debug)]
+struct SimSerialError;
+
+impl std::fmt::Display for SimSerialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sim serial")
+    }
+}
+
+impl vcxtoolkit::SerialPort for SimSerial {
+    type Error = SimSerialError;
+
+    fn write(&self, buf: &[u8]) -> std::result::Result<usize, SimSerialError> {
+        // The driver writes one complete 0xBB frame per call; parse it and queue the
+        // dongle's reply(ies).
+        if let Ok(frame) = vcxtoolkit::unpack(buf) {
+            let channel = frame.header[3];
+            let replies: Vec<u8> = match frame.header[2] {
+                // Bring-up commands (header[1] == 0): ack echoing the command, status 00.
+                command @ (0x40 | 0x42 | 0x45 | 0x48) if frame.header[1] == 0 => {
+                    vcxtoolkit::pack([0x80, 0x00, command, channel], &[0x00]).unwrap_or_default()
+                }
+                // VCX_PRO_Send (header[2] == 0): the 0x9B status ack, then the pushed reply.
+                0x00 => {
+                    let reply = simulate_reply(&frame.payload, self.resp_id);
+                    let ack =
+                        vcxtoolkit::pack([0x80, 0x00, 0x00, channel], &[0x9B]).unwrap_or_default();
+                    let pushed =
+                        vcxtoolkit::pack([0x80, 0x00, 0x00, channel], &sim_recv_envelope(&reply))
+                            .unwrap_or_default();
+                    [ack, pushed].concat()
+                }
+                _ => Vec::new(),
+            };
+            self.queue.borrow_mut().extend(replies);
+        }
+        Ok(buf.len())
+    }
+
+    fn read(&self, buf: &mut [u8]) -> std::result::Result<usize, SimSerialError> {
+        let mut queue = self.queue.borrow_mut();
+        let n = buf.len().min(queue.len());
+        for slot in buf.iter_mut().take(n) {
+            *slot = queue.pop_front().unwrap_or(0);
+        }
+        Ok(n)
+    }
+}
+
+/// The simulated reply for a framed request: the 4-byte response CAN id, then the
+/// application PDU — `$7E` for `$3E`, `$5A <lid>` plus ASCII identity bytes for `$1A`,
+/// else a `serviceNotSupported` negative. The leading id mirrors a real ECU reply,
+/// which the reader strips with `split_rx_id`.
+fn simulate_reply(framed_request: &[u8], resp_id: u16) -> Vec<u8> {
+    // send_payload: [flags u32 BE][len u16 BE][data]; data = [can-id 4 BE][uds...].
+    let uds = framed_request.get(10..).unwrap_or(&[]);
+    let app = match uds.first().copied() {
+        Some(s) if s == udskit::testerpresent::TESTER_PRESENT => {
+            vec![TESTER_PRESENT_POSITIVE_SID, 0x00]
+        }
+        Some(0x1A) => {
+            let lid = uds.get(1).copied().unwrap_or(0);
+            let mut reply = vec![crate::vcx::GM_IDENTITY_POSITIVE_SID, lid];
+            reply.extend_from_slice(format!("SIM{lid:02X}").as_bytes());
+            reply
+        }
+        other => vec![0x7F, other.unwrap_or(0), 0x11],
+    };
+    let mut out = u32::from(resp_id).to_be_bytes().to_vec();
+    out.extend_from_slice(&app);
+    out
+}
+
+/// Wrap application bytes in the recovered `VCX_PRO_Recv` envelope: flags `u32` LE,
+/// length `u16` LE, then the bytes — exactly what [`crate`]'s reply parser consumes.
+fn sim_recv_envelope(app: &[u8]) -> Vec<u8> {
+    let mut pdu = Vec::with_capacity(6 + app.len());
+    pdu.extend_from_slice(&0_u32.to_le_bytes());
+    pdu.extend_from_slice(&u16::try_from(app.len()).unwrap_or(0).to_le_bytes());
+    pdu.extend_from_slice(app);
+    pdu
+}
+
+/// Drive the full read over [`SimByteSource`] — the same preflight + `$1A` loop the
+/// real path runs, with no hardware. Proves the reader parses a reply correctly.
+fn simulate(opts: &Opts) -> (i32, String) {
+    let mut log = String::new();
+    header(
+        &mut log,
+        opts,
+        "SIMULATE (fake dongle over the REAL native transport — no hardware)",
+    );
+    match open_plan_lines(opts) {
+        Ok(lines) => log.push_str(&lines),
+        Err(e) => return (1, format!("{log}\nerror building open plan: {e}")),
+    }
+    logln(&mut log, "");
+    logln(
+        &mut log,
+        "The fake speaks the VCX frame protocol, so the real VcxByteSource runs its \
+         channel bring-up, Send and pushed-reply read against canned ECU responses: a \
+         positive $7E for TesterPresent and a positive $5A for each $1A.",
+    );
+    logln(&mut log, "");
+
+    let serial = SimSerial::new(opts.resp_header);
+    let mut source = match crate::vcx_device::VcxByteSource::with_port(
+        serial,
+        opts.channel,
+        opts.caller,
+        opts.timeout,
+    ) {
+        Ok(source) => source.with_can_ids(opts.req_header, opts.resp_header),
+        Err(e) => return (1, format!("{log}\nerror building the simulated seam: {e}")),
+    };
+
+    logln(
+        &mut log,
+        "TesterPresent probe ($3E 00) [over the native transport]:",
+    );
+    let Ok(proof) = tester_present(&mut source, opts.req_header, &mut log) else {
+        logln(&mut log, "");
+        logln(
+            &mut log,
+            "SIMULATE FAILED: the native transport did not return a positive $7E from the fake.",
+        );
+        return (1, log);
+    };
+    if opts.ping {
+        logln(&mut log, "");
+        logln(
+            &mut log,
+            "SIMULATE PROBE OK: the native transport parsed a positive $7E.",
+        );
+        return (0, log);
+    }
+    let code = read_identities_live(&mut source, opts, &mut log, proof);
+    (code, log)
 }
 
 // ----- dry run (opens nothing, sends nothing) ---------------------------------------------
@@ -303,8 +479,8 @@ fn transmit(opts: &Opts) -> (i32, String) {
 ///
 /// The `_proof: PipeProven` parameter is the gate: this function cannot be called
 /// without a token minted by a positive [`tester_present`], so the `$1A` read is
-/// structurally unreachable until the pipe is proven.
-#[cfg(windows)]
+/// structurally unreachable until the pipe is proven. Reached from the Windows
+/// `transmit` and from `--simulate` (which runs on any platform).
 fn read_identities_live(
     source: &mut dyn ByteSource,
     opts: &Opts,
@@ -672,6 +848,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         match a.as_str() {
             "--print-only" => opts.print_only = true,
             "--ping" => opts.ping = true,
+            "--simulate" => opts.simulate = true,
             "--port" => {
                 opts.port = parse_port(next(&mut it, "--port")?)?;
                 port_set = true;
@@ -697,7 +874,7 @@ fn parse(args: &[String]) -> Result<Opts> {
             }
         }
     }
-    if !port_set {
+    if !port_set && !opts.simulate {
         return Err(Error::Refused(
             "vcx-read needs --port <N> (the COM number the doctor/detection layer found)".into(),
         ));
@@ -764,6 +941,9 @@ pub fn usage() -> String {
      \u{20}                     (also the default off Windows, where the transmit is unavailable)\n\
      \u{20}  --ping             send only TesterPresent ($3E 00) — the safest first probe:\n\
      \u{20}                     proves the VCX pipe works before any data read\n\
+     \u{20}  --simulate         drive the whole read over an in-process fake dongle that\n\
+     \u{20}                     speaks the VCX frame protocol — proves the native transport\n\
+     \u{20}                     and parser end to end with no hardware (needs no --port)\n\
      \u{20}  --lid <hex>        a $1A identifier to read (repeatable; default C1..CA, CB, CC)\n\
      \u{20}  --out <file>       write the assembled saved-read to <file>\n\
      \u{20}  --ecu <name>       saved-read controller name (metadata; default BECM)\n\
