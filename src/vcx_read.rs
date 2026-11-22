@@ -101,8 +101,8 @@ impl Default for Opts {
 ///
 /// Transmits by default on Windows with a port. `--print-only` (or any non-Windows
 /// platform) makes it a dry run that opens nothing and sends nothing. The read stays
-/// read-only: only `$3E`/`$1A` are ever built (the [`frame_request`] guard), and the
-/// `$1A` loop is still blocked behind a positive TesterPresent ([`PipeProven`]).
+/// read-only: only `$3E`/`$1A` are ever built (the `frame_request` guard), and the
+/// `$1A` loop is still blocked behind a positive TesterPresent (`PipeProven`).
 #[must_use]
 pub fn run(args: &[String]) -> (i32, String) {
     let opts = match parse(args) {
