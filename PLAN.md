@@ -22,8 +22,9 @@ Authorised interoperability / defensive research on hardware the owner holds.
   externally (`--key <hex>`). The ADIT ALD RSA-2048 path is documented, never automated.
 - **No bus-opening in the library core beyond the ELM line protocol.** The ELM327 adapter
   runs ISO-TP; gmdiag speaks AT lines + hex PDUs to it. Raw CAN (`IsoTpCan` over `isotpkit`)
-  and J2534 / VCX (`vcxtoolkit`) are planned rows, the latter blocked on SAE J2534 not being
-  in `primarysource`.
+  now runs ISO-TP itself over a `CanLink` seam, mock-tested with no hardware; its on-vehicle
+  validation (a real SLCAN dongle / SocketCAN) is a planned row, as is J2534 / VCX
+  (`vcxtoolkit`), the latter blocked on SAE J2534 not being in `primarysource`.
 - **No write or actuation without an explicit flag and a typed confirmation.** Read-first by
   default. `--write` / `--actuate` arm the write services; each still prompts before it sends.
 - **Owner-authorised vehicle only.** A dry-run / replay mode runs the whole stack against a
@@ -54,9 +55,13 @@ Impls:
   form) back into a PDU. The line + reply parsing is ported from voltkit's proven `elm`
   module — but gmdiag's transport is **neutral**: it does not refuse write SIDs. Gating lives
   one layer up, in the session / CLI.
-- **`IsoTpCan` (LATER, planned row).** Raw CAN + `isotpkit` framing. A compiled stub that
-  constructs `isotpkit` PCI/segment types but whose `request` returns "raw-CAN transport not
-  yet wired" — honest `[open]` row, no hardware here.
+- **`IsoTpCan` (raw CAN).** Runs ISO-TP (ISO 15765-2) itself over a `CanLink` seam
+  (`send_frame` / `recv_frame`): `isotpkit` does segmentation + reassembly, `IsoTpCan` paces the
+  exchange with flow control (wait for FC after the FirstFrame, send CFs up to `BlockSize`,
+  honour `STmin`; grant the sender a FC ContinueToSend for a multi-frame response). Neutral like
+  `Elm327Tcp`. Proved against a scripted `MockCanLink` with no hardware. A pure-safe `SlcanTcp`
+  (LAWICEL SLCAN over TCP) is the concrete link; a native SocketCAN link needs `unsafe`/`libc`
+  (forbidden here) and stays `[open]`, as does on-vehicle validation.
 - **`Replay` (test / dry-run).** Not strictly a `Transport`; the dry-run path runs `Elm327Tcp`
   against a spawned `fakeobd`.
 
