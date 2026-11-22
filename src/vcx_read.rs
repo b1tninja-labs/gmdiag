@@ -237,13 +237,17 @@ fn transmit(opts: &Opts) -> (i32, String) {
     );
     let mut source =
         match VcxByteSource::open_with_params(opts.port, opts.channel, opts.caller, opts.timeout) {
-            Ok(s) => s,
+            Ok(s) => s.with_can_ids(opts.req_header, opts.resp_header),
             Err(e) => {
                 logln(&mut log, format!("  !! could not open the dongle: {e}"));
                 return (1, log);
             }
         };
-    logln(&mut log, "  dongle port opened (no vehicle byte sent yet).");
+    logln(
+        &mut log,
+        "  dongle port opened. The first exchange brings up the ISO 15765 channel \
+         (open, SetComParam, flow-control AddFilter, Start) before any vehicle byte.",
+    );
 
     // TesterPresent first: the safest real transmission. For --ping it is the whole
     // job; otherwise it is the preflight, and a non-positive answer stops the read.

@@ -72,6 +72,11 @@ pub const DEFAULT_CALLER: u8 = 0;
 /// crate opens this port on its own.
 pub const DEFAULT_DOCTOR_PORT: u32 = 4;
 
+/// The HS-GMLAN / diagnostic CAN baud the channel is configured for: the J2534
+/// `PassThruConnect` baud the recovered connect passes in its one `SetComParam`
+/// record (`VCX_PRO_SetComParam`, key `3`). GM diagnostic CAN is 500 kbit/s.
+pub const DEFAULT_CAN_BAUD: u32 = 500_000;
+
 /// A [`ByteSource`] that drives `vcxtoolkit`'s channel-open plus Send/Recv exchange
 /// over a [`SerialPort`].
 ///
@@ -89,6 +94,15 @@ pub struct VcxByteSource<S: SerialPort> {
     port: S,
     channel: Channel,
     timeout: Duration,
+    /// The request/response arbitration ids the ISO 15765 flow-control filter is
+    /// built from (`AddFilter`: mask `FF..`, pattern = response id, flow = request
+    /// id). `0`/`0` adds no filter — the bare open+send path the offline tests drive.
+    req_id: u16,
+    resp_id: u16,
+    /// Whether the ISO 15765 channel has already been brought up on this port
+    /// (open → SetComParam → AddFilter → Start). The bring-up runs once; every
+    /// later exchange reuses the open channel and only does Send + the pushed read.
+    connected: bool,
 }
 
 impl<S: SerialPort> VcxByteSource<S> {
@@ -111,7 +125,23 @@ impl<S: SerialPort> VcxByteSource<S> {
             port,
             channel,
             timeout,
+            req_id: 0,
+            resp_id: 0,
+            connected: false,
         })
+    }
+
+    /// Set the request/response CAN ids the ISO 15765 flow-control filter is built
+    /// from, so the dongle forwards the request and delivers the ECU's pushed reply.
+    ///
+    /// Without a filter the dongle accepts the Send but returns only its 1-byte
+    /// status ack (`0x9B`) and never forwards to the bus. With `7E0`/`7E8` set, the
+    /// connect installs the flow-control filter before `Start`.
+    #[must_use]
+    pub fn with_can_ids(mut self, req_id: u16, resp_id: u16) -> Self {
+        self.req_id = req_id;
+        self.resp_id = resp_id;
+        self
     }
 
     /// The channel this seam opens for each exchange.
@@ -184,16 +214,176 @@ fn map_device_error<E: std::fmt::Display>(error: &DeviceError<E>) -> Error {
     }
 }
 
+/// Map a `forward` builder refusal (a payload that could not be built) into the
+/// crate error. These are construction errors, not link failures, so they are a
+/// [`Error::Protocol`].
+fn forward_err(error: vcxtoolkit::ForwardError) -> Error {
+    Error::Protocol(format!("vcx connect: {error}"))
+}
+
+/// Write one VCX command over the port and read its reply frame (the dongle's ack).
+fn send_command<S: SerialPort>(
+    port: &S,
+    header: [u8; 4],
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<vcxtoolkit::Frame>
+where
+    S::Error: std::fmt::Display,
+{
+    vcxtoolkit::exchange_with(
+        port,
+        header,
+        payload,
+        &mut vcxtoolkit::Deadline::new(timeout),
+    )
+    .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))
+}
+
+/// Bring the ISO 15765 channel up on the dongle: the recovered `PassThruConnect`
+/// sequence `VCX_PRO_Open` → `SetComParam(baud)` → `AddFilter(flow control)` →
+/// `ProStart`. Runs once per [`VcxByteSource`]; later exchanges reuse the channel.
+///
+/// Without this a `VCX_PRO_Send` gets only the dongle's 1-byte status ack (`0x9B`)
+/// because the channel is never configured or forwarded. The flow-control filter
+/// (mask `FF..`, pattern = the response id, flow = the request id) is what makes the
+/// dongle forward the request and push the ECU reply back.
+fn bring_up_channel<S: SerialPort>(
+    port: &S,
+    channel: Channel,
+    req_id: u16,
+    resp_id: u16,
+    timeout: Duration,
+) -> Result<()>
+where
+    S::Error: std::fmt::Display,
+{
+    use vcxtoolkit::{
+        Command, FilterCopy, add_filter, baud_record, set_com_param, start_filter, start_payload,
+    };
+    let ch = channel.channel;
+
+    // 1. Open the ISO 15765 data channel (the reply must echo VCX_PRO_Open).
+    channel
+        .open(port, timeout)
+        .map_err(|error| map_device_error(&error))?;
+
+    // 2. SetComParam: the CAN baud, the recovered PassThruConnect SetComParam record.
+    let com = set_com_param(&[baud_record(DEFAULT_CAN_BAUD)]).map_err(forward_err)?;
+    send_command(port, Command::ProSetComParam.header(ch), &com, timeout)?;
+
+    // 3. AddFilter: the ISO 15765 flow-control filter. Skipped when no ids are set
+    //    (the bare open+send path the offline tests drive).
+    if resp_id != 0 {
+        let pattern = u32::from(resp_id).to_be_bytes();
+        let mask = [0xFF_u8; 4];
+        let flow = u32::from(req_id).to_be_bytes();
+        let filter = start_filter(&FilterCopy {
+            slot: 0,
+            kind: 3,
+            pattern: &pattern,
+            mask: &mask,
+            flow: &flow,
+            extend_first: false,
+        })
+        .map_err(forward_err)?;
+        let payload = add_filter(&[filter]).map_err(forward_err)?;
+        send_command(port, Command::ProAddFilter.header(ch), &payload, timeout)?;
+    }
+
+    // 4. Start the channel.
+    send_command(
+        port,
+        Command::ProStart.header(ch),
+        &start_payload(),
+        timeout,
+    )?;
+    Ok(())
+}
+
+/// The first complete `0xBB`…`0xBB` frame in `buf`, if one is buffered.
+///
+/// Mirrors `vcxtoolkit`'s own frame scan: the first `0xBB` opens, and the first
+/// later `0xBB` that makes [`vcxtoolkit::unpack`] accept the slice closes it.
+fn first_complete_frame(buf: &[u8]) -> Option<vcxtoolkit::Frame> {
+    let open = buf.iter().position(|&b| b == 0xBB)?;
+    for (close, _) in buf
+        .iter()
+        .enumerate()
+        .skip(open + 1)
+        .filter(|&(_, &b)| b == 0xBB)
+    {
+        if let Ok(frame) = vcxtoolkit::unpack(&buf[open..=close]) {
+            return Some(frame);
+        }
+    }
+    None
+}
+
+/// Read the reply frame the dongle PUSHES after a `VCX_PRO_Send` ack.
+///
+/// `VCX_PRO_Recv` is virtualized and unrecovered; the dongle instead pushes the ECU
+/// reply on the serial as its own `0xBB` frame once the channel is up. This reads
+/// that frame and returns its payload — the `VCX_PRO_Recv` envelope
+/// [`vcxtoolkit::collect::reply_application_bytes`] consumes. On a timeout it returns
+/// the raw bytes seen, so an on-car run that does not match this model is diagnosable.
+fn read_pushed_frame<S: SerialPort>(port: &S, timeout: Duration) -> Result<Vec<u8>>
+where
+    S::Error: std::fmt::Display,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        match port.read(&mut chunk) {
+            Ok(0) => {}
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(frame) = first_complete_frame(&buf) {
+                    return Ok(frame.payload);
+                }
+            }
+            Err(error) => return Err(Error::Io(std::io::Error::other(error.to_string()))),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Protocol(format!(
+                "no pushed reply frame within {} ms after the Send ack (raw bytes: {buf:02X?})",
+                timeout.as_millis(),
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 impl<S: SerialPort> ByteSource for VcxByteSource<S>
 where
     S::Error: std::fmt::Display,
 {
     fn exchange(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
-        let reply = self
-            .channel
-            .exchange(&self.port, framed_request, self.timeout)
-            .map_err(|error| map_device_error(&error))?;
-        Ok(reply.payload)
+        // Bring the ISO 15765 channel up once; every later exchange reuses it.
+        if !self.connected {
+            bring_up_channel(
+                &self.port,
+                self.channel,
+                self.req_id,
+                self.resp_id,
+                self.timeout,
+            )?;
+            self.connected = true;
+        }
+
+        // Send the caller's already-framed VCX_PRO_Send request. The Send reply is
+        // only the dongle's 1-byte status ack (0x9B is normal); the ECU reply is
+        // pushed on the serial as a separate frame after the ack.
+        let _ack = send_command(
+            &self.port,
+            vcxtoolkit::pro_send_header(self.channel.caller, self.channel.channel),
+            framed_request,
+            self.timeout,
+        )?;
+
+        // Read the pushed reply frame; its payload is the VCX_PRO_Recv envelope.
+        read_pushed_frame(&self.port, self.timeout)
     }
 }
 
@@ -280,8 +470,36 @@ mod tests {
         pdu
     }
 
-    fn send_reply(app: &[u8]) -> Vec<u8> {
+    // The dongle's ack for a config command (SetComParam/Start): a frame echoing the
+    // command byte, empty payload. send_command only reads it; the content is ignored.
+    fn cmd_ack(cmd: u8) -> Vec<u8> {
+        pack([0x80, 0x00, cmd, DEFAULT_CHANNEL], &[]).unwrap()
+    }
+
+    // The 1-byte status ack a VCX_PRO_Send returns (0x9B on hardware). It is read and
+    // discarded; the ECU reply arrives as the pushed frame after it.
+    fn send_ack() -> Vec<u8> {
+        pack([0x80, 0x00, 0x00, DEFAULT_CHANNEL], &[0x9B]).unwrap()
+    }
+
+    // The ECU reply frame the dongle pushes after the Send ack. Its payload is the
+    // recovered VCX_PRO_Recv envelope the adapter unwraps.
+    fn pushed(app: &[u8]) -> Vec<u8> {
         pack([0x80, 0x00, 0x00, DEFAULT_CHANNEL], &recv_envelope(app)).unwrap()
+    }
+
+    // Every frame one full exchange consumes with no filter (req/resp ids 0): the
+    // open, SetComParam and Start acks, the Send ack, then the pushed ECU frame.
+    const PRO_SETCOMPARAM: u8 = 0x45;
+    const PRO_START: u8 = 0x42;
+    fn connected_reads(app: &[u8]) -> Vec<Vec<u8>> {
+        vec![
+            open_ack(),
+            cmd_ack(PRO_SETCOMPARAM),
+            cmd_ack(PRO_START),
+            send_ack(),
+            pushed(app),
+        ]
     }
 
     fn source(chunks: Vec<Vec<u8>>) -> VcxByteSource<FakeSerial> {
@@ -300,21 +518,23 @@ mod tests {
         // recovered Recv envelope the gmdiag adapter unwraps. The request it is given
         // is already framed (flags BE + len BE + `1A C1`), as the adapter supplies it.
         let app = [IDENTITY_POSITIVE_SID, 0xC1, 0x31, 0x32];
-        let mut seam = source(vec![open_ack(), send_reply(&app)]);
+        let mut seam = source(connected_reads(&app));
         let framed_request = vec![0, 0, 0, 0, 0, 2, 0x1A, 0xC1];
 
         let payload = seam.exchange(&framed_request).unwrap();
 
-        // The returned payload is exactly what reply_application_bytes consumes.
+        // The returned payload is the pushed ECU frame's envelope, exactly what
+        // reply_application_bytes consumes.
         assert_eq!(payload, recv_envelope(&app));
         assert_eq!(reply_application_bytes(&payload).unwrap(), &app);
 
-        // Exactly two frames went out: the channel open, then the caller's framed
-        // request wrapped in the VCX_PRO_Send header. No request content was synthesized.
+        // Four frames went out: the channel bring-up (open, SetComParam, Start), then
+        // the caller's framed request wrapped in the VCX_PRO_Send header. No request
+        // content was synthesized.
         let writes = seam.port().writes.borrow();
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 4);
         assert_eq!(
-            writes[1],
+            writes[3],
             pack(
                 pro_send_header(DEFAULT_CALLER, DEFAULT_CHANNEL),
                 &framed_request
@@ -329,7 +549,7 @@ mod tests {
         // satisfies the injected ByteSource seam: udskit builds `1A C1`, the transport
         // frames it, this seam drives the fake dongle, and udskit parses the reply.
         let app = [IDENTITY_POSITIVE_SID, 0xC1, 0x2A];
-        let seam = source(vec![open_ack(), send_reply(&app)]);
+        let seam = source(connected_reads(&app));
         let mut transport = VcxTransport::new(seam);
 
         let read = read_identity(&mut transport, 0xC1).unwrap();
@@ -338,11 +558,11 @@ mod tests {
         // The bytes that reached the seam are the udskit-built, vcx-framed request.
         let seam = transport.into_source();
         let writes = seam.port().writes.borrow();
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 4);
         let expected_request =
             vcxtoolkit::collect::frame_identity_request(&build_identity_request(0xC1)).unwrap();
         assert_eq!(
-            writes[1],
+            writes[3],
             pack(
                 pro_send_header(DEFAULT_CALLER, DEFAULT_CHANNEL),
                 &expected_request
@@ -356,7 +576,7 @@ mod tests {
         // A negative $1A is not a device error: it rides the recovered envelope and
         // surfaces only when the adapter parses the application PDU.
         let app = [0x7F, 0x1A, 0x31]; // requestOutOfRange
-        let seam = source(vec![open_ack(), send_reply(&app)]);
+        let seam = source(connected_reads(&app));
         let mut transport = VcxTransport::new(seam);
         let error = read_identity(&mut transport, 0xC1).unwrap_err();
         assert!(matches!(error, crate::Error::Negative(_)), "{error:?}");
