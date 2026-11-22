@@ -18,6 +18,10 @@
 //!   TesterPresent keep-alive, the `0x78` response-pending loop, and the UDS services, each
 //!   write/actuation gated by an [`Arm`](session::Arm) level.
 //! - [`spawn`] — spawns `fakeobd` for the fakeobd-first dry-run and the tests.
+//! - [`vcx`] — an offline [`Transport`](transport::Transport) adapter that carries GMLAN `$1A`
+//!   identity reads over `vcxtoolkit`'s recovered frame codecs and assembles them into a
+//!   `vcxtoolkit::modread` saved read. Driven only by an in-process fake; the hardware byte
+//!   seam is out of scope and stays gated (`vcxtoolkit::collect::vehicle_read_gate`).
 //! - [`cli`] — the read-first command line.
 //!
 //! # Boundaries
@@ -32,6 +36,7 @@ pub mod error;
 pub mod session;
 pub mod spawn;
 pub mod transport;
+pub mod vcx;
 
 pub use error::{Error, Result};
 

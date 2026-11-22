@@ -12,6 +12,11 @@ A single binary+library crate: `Cargo.toml`, `src/`, `tests/`.
 - `src/session.rs` — `Session<T: Transport>`: session control, keep-alive, the `0x78` loop, and
   the UDS services, each write/actuation gated by an `Arm` level.
 - `src/spawn.rs` — spawns the `fakeobd` binary for the dry-run and the tests (does not link it).
+- `src/vcx.rs` — an offline `Transport` adapter over `vcxtoolkit`'s recovered VCX frame codecs
+  (`collect::frame_identity_request` / `reply_application_bytes`): builds a GMLAN `$1A` read with
+  `udskit`, exchanges it over an injected `ByteSource` seam, parses the reply with `udskit`, and
+  assembles the identities into a `vcxtoolkit::modread` saved read. Ships only an in-process
+  `FakeByteSource`; the hardware seam is out of scope and stays gated.
 - `src/cli.rs` — the read-first command line; `run(argv, confirm) -> (code, text)`.
 - `src/main.rs` — the entry point; a terminal `y/N` confirmation callback.
 

@@ -15,6 +15,9 @@ udskit = { path = "../udskit" }
 isotpkit = { path = "../isotpkit" }
 gmdtcdb = { path = "../gmdtcdb" }
 mode06kit = { path = "../mode06kit" }
+# vcxtoolkit: the recovered VCX frame codecs (frame_identity_request / reply_application_bytes)
+# and the saved module-read writer (modread) for the offline identity-collection adapter.
+vcxtoolkit = { path = "../vcxtoolkit" }
 
 [lints.rust]
 unsafe_code = "forbid"
