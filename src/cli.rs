@@ -338,17 +338,17 @@ fn catalog(rest: &[String]) -> String {
             .map(|s| format!("{:02X} {}", s.sid, s.name))
             .collect::<Vec<_>>()
             .join("\n"),
-        "routines" => udskit::routine::catalog()
+        "routines" => udskit::gm::routines::catalog()
             .iter()
             .map(|r| format!("{} {} (risk {}) — {}", r.hex(), r.name, r.risk, r.effect))
             .collect::<Vec<_>>()
             .join("\n"),
-        "security" => udskit::security::MECHANISMS
+        "security" => udskit::gm::security::MECHANISMS
             .iter()
             .map(|(k, m)| format!("{k}: {} [{}] — {}", m.name, m.family, m.summary))
             .collect::<Vec<_>>()
             .join("\n\n"),
-        "dids" => udskit::did::read_dids()
+        "dids" => udskit::gm::dids::read_dids()
             .iter()
             .map(|d| format!("{} [{}]", d.hex(), d.category))
             .collect::<Vec<_>>()
