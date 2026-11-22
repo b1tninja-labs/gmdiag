@@ -1,0 +1,29 @@
+[package]
+name = "gmdiag"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Live read/write GM Techline/GDS2 diagnostic driver: Transport trait + ELM327-over-TCP, UDS/GMLAN session core over udskit/gmdtcdb/mode06kit, read-first CLI with gated writes, fakeobd-first"
+license = "Apache-2.0"
+readme = "README.md"
+publish = false # offline-grounded vehicle driver linking publish=false siblings; not published
+
+[dependencies]
+# Portfolio siblings by path (the workspace pattern, e.g. fakeprint-python -> ../fakeprint).
+# All are publish = false. gmdiag drives them; it adds the live link they refuse to open.
+udskit = { path = "../udskit" }
+isotpkit = { path = "../isotpkit" }
+gmdtcdb = { path = "../gmdtcdb" }
+mode06kit = { path = "../mode06kit" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# The prose carries protocol terms (ISO-TP, SocketCAN, GMLAN, N_PDU, service names) that
+# doc_markdown would want in backticks throughout; the siblings (udskit, gmdtcdb) allow it in the
+# manifest for the same reason rather than scatter #![allow] across every doc line.
+doc_markdown = "allow"
