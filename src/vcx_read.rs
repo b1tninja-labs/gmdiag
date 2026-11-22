@@ -64,9 +64,11 @@ struct Opts {
     out: Option<String>,
     /// The controller name the saved-read is filed under (metadata only).
     ecu: String,
-    /// The saved-read request header (metadata only; not the transmitted CAN id).
+    /// The request CAN arbitration id: the 4-byte big-endian prefix on every
+    /// transmitted raw-mode request, and the saved-read request header.
     req_header: u16,
-    /// The saved-read response header (metadata only).
+    /// The expected response CAN id (saved-read response header; the rx id is read
+    /// from the reply, not enforced against this).
     resp_header: u16,
     /// The VCX framing channel byte (caller-supplied, not recovered).
     channel: u8,
@@ -85,8 +87,8 @@ impl Default for Opts {
             lids: DEFAULT_IDENTITY_LIDS.to_vec(),
             out: None,
             ecu: "BECM".to_string(),
-            req_header: 0x7E4,
-            resp_header: 0x7EC,
+            req_header: 0x7E0,
+            resp_header: 0x7E8,
             channel: 0,
             caller: 0,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -133,11 +135,15 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
         &mut log,
         "TesterPresent probe that WOULD be sent FIRST (nothing is transmitted):",
     );
-    match frame_for_display(build_tester_present()) {
+    match frame_for_display(&build_tester_present(), opts.req_header) {
         Ok((req, framed)) => {
             logln(
                 &mut log,
-                format!("    UDS request (3E 00):           {}", hex(&req)),
+                format!(
+                    "    request (id {:03X} + 3E 00):     {}",
+                    opts.req_header,
+                    hex(&req)
+                ),
             );
             logln(
                 &mut log,
@@ -154,12 +160,16 @@ fn dry_run(opts: &Opts, can_transmit: bool) -> (i32, String) {
             "framed $1A requests that WOULD follow a positive probe (nothing is transmitted):",
         );
         for &lid in &opts.lids {
-            match frame_for_display(build_identity_request(lid)) {
+            match frame_for_display(&build_identity_request(lid), opts.req_header) {
                 Ok((req, framed)) => {
                     logln(&mut log, format!("  lid {lid:02X}:"));
                     logln(
                         &mut log,
-                        format!("    UDS request (udskit 1A <lid>): {}", hex(&req)),
+                        format!(
+                            "    request (id {:03X} + 1A {lid:02X}):  {}",
+                            opts.req_header,
+                            hex(&req)
+                        ),
                     );
                     logln(
                         &mut log,
@@ -252,7 +262,7 @@ fn transmit(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> (i32, String)
     // job; otherwise it is the preflight, and a non-positive answer stops the read.
     logln(&mut log, "");
     logln(&mut log, "TesterPresent probe ($3E 00):");
-    let proven = tester_present(&mut source, &mut log);
+    let proven = tester_present(&mut source, opts.req_header, &mut log);
     if opts.ping {
         logln(&mut log, "");
         return if proven.is_ok() {
@@ -313,7 +323,7 @@ fn read_identities_live(
     logln(log, "");
     for &lid in &opts.lids {
         logln(log, format!("lid {lid:02X}:"));
-        match read_one_identity(source, lid, log) {
+        match read_one_identity(source, lid, opts.req_header, log) {
             Ok(read) => reads.push(read),
             Err(_) => failures += 1,
         }
@@ -384,16 +394,30 @@ fn build_tester_present() -> Vec<u8> {
     udskit::testerpresent::build_request()
 }
 
-/// Frame a UDS request for the VCX send codec, refusing any service not in
-/// [`ALLOWED_SERVICES`].
+/// The raw-mode VCX_PRO_Send offset-6 payload: the 4-byte request CAN id
+/// (big-endian), then the UDS bytes.
 ///
-/// This is the hard read-only gate: it is a runtime check (not a debug assert), so a
-/// release build cannot transmit a write or `$27` even if a future caller tried.
+/// This is the recovered convention — `VCXPT32!ConvertPassthruMsg` copies the J2534
+/// `PASSTHRU_MSG.Data` to offset 6 unchanged, and in raw/PassThru mode the first 4
+/// bytes of that data are the CAN arbitration id (ISO 22900-2:2009 §9.2.6.3.6; SAE
+/// J2534-1 raw mode). An earlier version sent the bare UDS with no id, so the dongle
+/// could not route the request.
+fn raw_mode_payload(req_id: u16, uds: &[u8]) -> Vec<u8> {
+    let mut payload = u32::from(req_id).to_be_bytes().to_vec();
+    payload.extend_from_slice(uds);
+    payload
+}
+
+/// Build the raw-mode offset-6 payload and frame it, refusing any service not in
+/// [`ALLOWED_SERVICES`]. Returns `(offset6_payload, framed_pdu)`.
+///
+/// The read-only gate is a runtime check (not a debug assert), so a release build
+/// cannot transmit a write or `$27` even if a future caller tried.
 ///
 /// # Errors
 /// [`Error::Refused`] when `uds` is empty or its service id is not read-only;
 /// [`Error::from`] on a framing error.
-fn frame_request(uds: &[u8]) -> Result<Vec<u8>> {
+fn frame_request(uds: &[u8], req_id: u16) -> Result<(Vec<u8>, Vec<u8>)> {
     let sid = uds.first().copied();
     if !sid.is_some_and(|s| ALLOWED_SERVICES.contains(&s)) {
         return Err(Error::Refused(format!(
@@ -401,7 +425,9 @@ fn frame_request(uds: &[u8]) -> Result<Vec<u8>> {
             sid.map_or_else(|| "(none)".to_string(), |s| format!("{s:#04X}"))
         )));
     }
-    Ok(frame_identity_request(uds)?)
+    let payload = raw_mode_payload(req_id, uds);
+    let framed = frame_identity_request(&payload)?;
+    Ok((payload, framed))
 }
 
 /// Frame, exchange, and unwrap one request over `source`, logging every stage's bytes.
@@ -414,16 +440,20 @@ fn frame_request(uds: &[u8]) -> Result<Vec<u8>> {
 fn exchange_and_unwrap(
     source: &mut dyn ByteSource,
     uds: &[u8],
+    req_id: u16,
     log: &mut String,
 ) -> Result<Vec<u8>> {
-    let framed = frame_request(uds)?;
-    logln(log, format!("  -> UDS request:             {}", hex(uds)));
+    let (payload, framed) = frame_request(uds, req_id)?;
+    logln(
+        log,
+        format!("  -> request (id {req_id:03X} + uds):  {}", hex(&payload)),
+    );
     logln(
         log,
         format!("  -> framed VCX_PRO_Send PDU: {}", hex(&framed)),
     );
 
-    let payload = match source.exchange(&framed) {
+    let reply = match source.exchange(&framed) {
         Ok(p) => p,
         Err(e) => {
             logln(
@@ -437,23 +467,44 @@ fn exchange_and_unwrap(
         log,
         format!(
             "  <- raw reply payload (VCX_PRO_Recv envelope): {}",
-            hex(&payload)
+            hex(&reply)
         ),
     );
 
-    match reply_application_bytes(&payload) {
-        Ok(app) => {
-            logln(log, format!("  <- application PDU:         {}", hex(app)));
-            Ok(app.to_vec())
-        }
+    let data = match reply_application_bytes(&reply) {
+        Ok(app) => app,
         Err(e) => {
             logln(
                 log,
                 format!("  !! reply envelope malformed (raw bytes above): {e}"),
             );
-            Err(e.into())
+            return Err(e.into());
         }
+    };
+
+    // Raw mode is symmetric: the reply data also leads with the 4-byte rx CAN id
+    // (`VCXPT32!ConvertVCXMsg` keeps it). Strip it before the UDS decode.
+    if let Some((id, app)) = split_rx_id(data) {
+        logln(
+            log,
+            format!("  <- rx id {id:03X}  application PDU: {}", hex(app)),
+        );
+        Ok(app.to_vec())
+    } else {
+        logln(
+            log,
+            format!("  <- application PDU (no 4-byte id prefix): {}", hex(data)),
+        );
+        Ok(data.to_vec())
     }
+}
+
+/// Split the 4-byte rx CAN id (big-endian) off the front of a raw-mode reply, or
+/// `None` when the reply is too short to carry one.
+#[cfg(any(windows, test))]
+fn split_rx_id(data: &[u8]) -> Option<(u32, &[u8])> {
+    let id = data.get(..4)?;
+    Some((u32::from_be_bytes([id[0], id[1], id[2], id[3]]), &data[4..]))
 }
 
 /// Proof that the VCX pipe answered a TesterPresent with a positive `$7E`.
@@ -481,10 +532,14 @@ struct PipeProven(());
 /// Transport/envelope errors from [`exchange_and_unwrap`]; [`Error::Negative`] on a
 /// `0x7F` answer; [`Error::Protocol`] when the positive response id is not `$7E`.
 #[cfg(any(windows, test))]
-fn tester_present(source: &mut dyn ByteSource, log: &mut String) -> Result<PipeProven> {
+fn tester_present(
+    source: &mut dyn ByteSource,
+    req_id: u16,
+    log: &mut String,
+) -> Result<PipeProven> {
     use udskit::message::{Response, decode_response};
 
-    let app = exchange_and_unwrap(source, &build_tester_present(), log)?;
+    let app = exchange_and_unwrap(source, &build_tester_present(), req_id, log)?;
     match decode_response(&app)? {
         Response::Positive(p) if p.response_sid == TESTER_PRESENT_POSITIVE_SID => {
             logln(
@@ -521,9 +576,10 @@ const TESTER_PRESENT_POSITIVE_SID: u8 = udskit::testerpresent::TESTER_PRESENT | 
 fn read_one_identity(
     source: &mut dyn ByteSource,
     lid: u8,
+    req_id: u16,
     log: &mut String,
 ) -> Result<vcxtoolkit::modread::IdentifierRead> {
-    let app = exchange_and_unwrap(source, &build_identity_request(lid), log)?;
+    let app = exchange_and_unwrap(source, &build_identity_request(lid), req_id, log)?;
     match parse_identity_reply(&app, lid) {
         Ok(value) => {
             logln(
@@ -542,13 +598,13 @@ fn read_one_identity(
     }
 }
 
-/// Build and frame one request for the dry-run display, returning `(uds, framed)`.
+/// Build and frame one request for the dry-run display, returning
+/// `(offset6_payload, framed)` — the id-prefixed bytes the live path would send.
 ///
 /// Routed through [`frame_request`], so the dry run shows exactly the bytes the live
-/// path would send and inherits the same read-only guard.
-fn frame_for_display(uds: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {
-    let framed = frame_request(&uds)?;
-    Ok((uds, framed))
+/// path would send and inherits the same read-only guard and the 4-byte id prefix.
+fn frame_for_display(uds: &[u8], req_id: u16) -> Result<(Vec<u8>, Vec<u8>)> {
+    frame_request(uds, req_id)
 }
 
 // ----- shared report pieces ---------------------------------------------------------------
@@ -716,8 +772,8 @@ pub fn usage() -> String {
      \u{20}  --lid <hex>        a $1A identifier to read (repeatable; default C1..CA, CB, CC)\n\
      \u{20}  --out <file>       write the assembled saved-read to <file>\n\
      \u{20}  --ecu <name>       saved-read controller name (metadata; default BECM)\n\
-     \u{20}  --req <hex>        saved-read request header (metadata; default 7E4)\n\
-     \u{20}  --resp <hex>       saved-read response header (metadata; default 7EC)\n\
+     \u{20}  --req <hex>        request CAN id, sent as the 4-byte raw-mode prefix (default 7E0)\n\
+     \u{20}  --resp <hex>       expected response CAN id / saved-read header (default 7E8)\n\
      \u{20}  --channel <hex>    VCX framing channel byte (default 00)\n\
      \u{20}  --caller <hex>     VCX framing caller byte (default 00)\n\
      \u{20}  --timeout-ms <n>   per-step exchange timeout (default 2000)\n\
@@ -735,6 +791,10 @@ mod tests {
     use super::*;
     use crate::vcx::{FakeByteSource, GM_IDENTITY_POSITIVE_SID};
 
+    // The request/response arbitration ids the tests transmit and expect back.
+    const TX: u16 = 0x7E0;
+    const RX: u16 = 0x7E8;
+
     fn reply_pdu(app: &[u8]) -> Vec<u8> {
         // The recovered VCX_PRO_Recv envelope: flags u32 LE, len u16 LE, then app bytes.
         let mut pdu = Vec::new();
@@ -744,15 +804,34 @@ mod tests {
         pdu
     }
 
-    fn positive(lid: u8, value: &[u8]) -> Vec<u8> {
-        let mut app = vec![GM_IDENTITY_POSITIVE_SID, lid];
-        app.extend_from_slice(value);
+    /// A reply's application bytes carry the 4-byte rx CAN id first (raw mode), then
+    /// the UDS response — wrap that in the Recv envelope.
+    fn rx_reply(uds: &[u8]) -> Vec<u8> {
+        let mut app = u32::from(RX).to_be_bytes().to_vec();
+        app.extend_from_slice(uds);
         reply_pdu(&app)
     }
 
-    /// A positive TesterPresent reply: `$7E 00`.
+    fn positive(lid: u8, value: &[u8]) -> Vec<u8> {
+        let mut uds = vec![GM_IDENTITY_POSITIVE_SID, lid];
+        uds.extend_from_slice(value);
+        rx_reply(&uds)
+    }
+
+    /// A positive TesterPresent reply: rx id, then `$7E 00`.
     fn tp_positive() -> Vec<u8> {
-        reply_pdu(&[TESTER_PRESENT_POSITIVE_SID, 0x00])
+        rx_reply(&[TESTER_PRESENT_POSITIVE_SID, 0x00])
+    }
+
+    /// The framed Send PDU for a raw-mode request to [`TX`]: flags(0) + len + the
+    /// 4-byte tx id + `uds`.
+    fn framed_to_tx(uds: &[u8]) -> Vec<u8> {
+        let mut payload = u32::from(TX).to_be_bytes().to_vec();
+        payload.extend_from_slice(uds);
+        let mut framed = vec![0, 0, 0, 0];
+        framed.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        framed.extend_from_slice(&payload);
+        framed
     }
 
     #[test]
@@ -793,51 +872,59 @@ mod tests {
     }
 
     #[test]
-    fn frame_request_allows_only_read_only_services() {
-        // $1A and $3E frame; the framed Send PDU carries the app bytes at offset 6.
+    fn frame_request_prefixes_the_can_id_and_allows_only_read_only_services() {
+        // Raw mode: the offset-6 payload is the 4-byte tx id then the UDS bytes, and
+        // the framed Send PDU wraps that (flags 0, len, payload).
         assert_eq!(
-            frame_request(&[0x1A, 0xC1]).unwrap(),
-            vec![0, 0, 0, 0, 0, 2, 0x1A, 0xC1]
+            frame_request(&[0x1A, 0xC1], TX).unwrap(),
+            (
+                vec![0, 0, 0x07, 0xE0, 0x1A, 0xC1],
+                framed_to_tx(&[0x1A, 0xC1])
+            ),
         );
         assert_eq!(
-            frame_request(&build_tester_present()).unwrap(),
-            vec![0, 0, 0, 0, 0, 2, 0x3E, 0x00]
+            frame_request(&build_tester_present(), TX).unwrap(),
+            (
+                vec![0, 0, 0x07, 0xE0, 0x3E, 0x00],
+                framed_to_tx(&[0x3E, 0x00])
+            ),
         );
         // The guard is a hard runtime refusal: $27 SecurityAccess and $2E write and an
         // empty request are all rejected before any byte could be framed.
         for bad in [vec![0x27, 0x01], vec![0x2E, 0xC1, 0x00], Vec::new()] {
-            let err = frame_request(&bad).unwrap_err();
+            let err = frame_request(&bad, TX).unwrap_err();
             assert!(matches!(err, Error::Refused(_)), "{err:?}");
         }
     }
 
     #[test]
     fn frame_for_display_routes_through_the_guard() {
-        // The dry-run display builder shows exactly the live bytes and inherits the guard.
-        let (uds, framed) = frame_for_display(build_identity_request(0xCC)).unwrap();
-        assert_eq!(uds, vec![0x1A, 0xCC]);
-        assert_eq!(framed, vec![0, 0, 0, 0, 0, 2, 0x1A, 0xCC]);
-        assert!(frame_for_display(vec![0x27, 0x01]).is_err());
+        // The dry-run display builder shows exactly the live bytes (id-prefixed) and
+        // inherits the same read-only guard.
+        let (payload, framed) = frame_for_display(&build_identity_request(0xCC), TX).unwrap();
+        assert_eq!(payload, vec![0, 0, 0x07, 0xE0, 0x1A, 0xCC]);
+        assert_eq!(framed, framed_to_tx(&[0x1A, 0xCC]));
+        assert!(frame_for_display(&[0x27, 0x01], TX).is_err());
     }
 
     #[test]
     fn tester_present_confirms_a_positive_7e() {
         let mut source = FakeByteSource::new(vec![tp_positive()]);
         let mut log = String::new();
-        assert!(tester_present(&mut source, &mut log).is_ok());
+        assert!(tester_present(&mut source, TX, &mut log).is_ok());
         assert!(log.contains("3E 00"), "the $3E 00 request is logged: {log}");
         assert!(log.contains("raw reply payload"), "{log}");
         assert!(log.contains("TesterPresent OK"), "{log}");
-        // The exact framed $3E 00 reached the seam.
-        assert_eq!(source.sent(), &[vec![0, 0, 0, 0, 0, 2, 0x3E, 0x00]]);
+        // The exact framed id-prefixed $3E 00 reached the seam.
+        assert_eq!(source.sent(), &[framed_to_tx(&[0x3E, 0x00])]);
     }
 
     #[test]
     fn tester_present_dumps_a_non_positive_answer() {
         // A negative $7F to $3E: Err, and the raw bytes are dumped, not swallowed.
-        let mut source = FakeByteSource::new(vec![reply_pdu(&[0x7F, 0x3E, 0x11])]);
+        let mut source = FakeByteSource::new(vec![rx_reply(&[0x7F, 0x3E, 0x11])]);
         let mut log = String::new();
-        let err = tester_present(&mut source, &mut log).unwrap_err();
+        let err = tester_present(&mut source, TX, &mut log).unwrap_err();
         assert!(matches!(err, Error::Negative(_)), "{err:?}");
         assert!(log.contains("7F 3E 11"), "raw reply must be dumped: {log}");
         assert!(log.contains("TesterPresent negative"), "{log}");
@@ -846,9 +933,9 @@ mod tests {
     #[test]
     fn tester_present_refuses_a_wrong_positive_id() {
         // A positive reply that is not $7E (here $5A) is refused with the bytes dumped.
-        let mut source = FakeByteSource::new(vec![reply_pdu(&[0x5A, 0x00])]);
+        let mut source = FakeByteSource::new(vec![rx_reply(&[0x5A, 0x00])]);
         let mut log = String::new();
-        let err = tester_present(&mut source, &mut log).unwrap_err();
+        let err = tester_present(&mut source, TX, &mut log).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "{err:?}");
         assert!(log.contains("5A 00"), "{log}");
     }
@@ -857,7 +944,7 @@ mod tests {
     fn read_one_identity_logs_bytes_and_parses() {
         let mut source = FakeByteSource::new(vec![positive(0xC1, &[0x31, 0x32])]);
         let mut log = String::new();
-        let read = read_one_identity(&mut source, 0xC1, &mut log).unwrap();
+        let read = read_one_identity(&mut source, 0xC1, TX, &mut log).unwrap();
         assert_eq!(
             read,
             vcxtoolkit::modread::IdentifierRead::lid(0xC1, vec![0x31, 0x32])
@@ -867,8 +954,8 @@ mod tests {
         assert!(log.contains("raw reply payload"), "{log}");
         assert!(log.contains("5A C1 31 32"), "{log}");
         assert!(log.contains("identity C1 value"), "{log}");
-        // The exact framed bytes reached the seam.
-        assert_eq!(source.sent(), &[vec![0, 0, 0, 0, 0, 2, 0x1A, 0xC1]]);
+        // The exact framed id-prefixed bytes reached the seam.
+        assert_eq!(source.sent(), &[framed_to_tx(&[0x1A, 0xC1])]);
     }
 
     #[test]
@@ -877,7 +964,7 @@ mod tests {
         // were already logged, which is the whole point of the tool.
         let mut source = FakeByteSource::new(vec![positive(0xC2, &[0xAB])]);
         let mut log = String::new();
-        let err = read_one_identity(&mut source, 0xC1, &mut log).unwrap_err();
+        let err = read_one_identity(&mut source, 0xC1, TX, &mut log).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "{err:?}");
         assert!(log.contains("5A C2 AB"), "raw reply must be dumped: {log}");
         assert!(log.contains("could not parse reply"), "{log}");
@@ -887,7 +974,7 @@ mod tests {
     fn read_one_identity_dumps_a_short_envelope() {
         let mut source = FakeByteSource::new(vec![vec![0x00, 0x00]]);
         let mut log = String::new();
-        assert!(read_one_identity(&mut source, 0xC1, &mut log).is_err());
+        assert!(read_one_identity(&mut source, 0xC1, TX, &mut log).is_err());
         assert!(log.contains("raw reply payload"), "{log}");
         assert!(log.contains("envelope malformed"), "{log}");
     }
@@ -897,7 +984,7 @@ mod tests {
         // An empty fake seam errors on exchange: no reply bytes, logged as such.
         let mut source = FakeByteSource::new(vec![]);
         let mut log = String::new();
-        assert!(read_one_identity(&mut source, 0xC1, &mut log).is_err());
+        assert!(read_one_identity(&mut source, 0xC1, TX, &mut log).is_err());
         assert!(log.contains("exchange failed"), "{log}");
     }
 
@@ -972,7 +1059,7 @@ mod tests {
         let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
         opts.lids = vec![0xC1, 0xCC];
         let mut log = String::new();
-        let proof = tester_present(&mut source, &mut log).expect("probe positive");
+        let proof = tester_present(&mut source, opts.req_header, &mut log).expect("probe positive");
         let code = read_identities_live(&mut source, &opts, &mut log, proof);
         assert_eq!(code, 0);
         assert!(log.contains("lid C1 0000002A"), "{log}");
@@ -989,7 +1076,7 @@ mod tests {
         let mut opts = parse(&["--port".into(), "4".into()]).unwrap();
         opts.lids = vec![0xC1];
         let mut log = String::new();
-        let proof = tester_present(&mut source, &mut log).expect("probe positive");
+        let proof = tester_present(&mut source, opts.req_header, &mut log).expect("probe positive");
         assert_eq!(read_identities_live(&mut source, &opts, &mut log, proof), 1);
         assert!(log.contains("no identities read"), "{log}");
     }
