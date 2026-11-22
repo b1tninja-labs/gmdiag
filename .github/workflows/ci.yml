@@ -9,19 +9,73 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # gmdiag path-depends on its portfolio siblings by `../<name>`. Check each one
+      # out as a flat sibling directory so `../udskit` … `../vcxtoolkit` resolve, then
+      # run cargo from the gmdiag dir. All siblings are public, so the default token
+      # reads them. fakeobd is not a path dep (spawned, not linked); its live tests
+      # SKIP when the binary is absent.
       - uses: actions/checkout@v4
+        with:
+          path: gmdiag
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/udskit
+          path: udskit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/isotpkit
+          path: isotpkit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/gmdtcdb
+          path: gmdtcdb
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/mode06kit
+          path: mode06kit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/vcxtoolkit
+          path: vcxtoolkit
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
+        working-directory: gmdiag
       - run: cargo clippy --all-targets -- -D warnings
+        working-directory: gmdiag
       - run: cargo test
+        working-directory: gmdiag
       - run: cargo doc --no-deps
+        working-directory: gmdiag
         env:
           RUSTDOCFLAGS: -D warnings
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: gmdiag
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/udskit
+          path: udskit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/isotpkit
+          path: isotpkit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/gmdtcdb
+          path: gmdtcdb
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/mode06kit
+          path: mode06kit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/vcxtoolkit
+          path: vcxtoolkit
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo test
+        working-directory: gmdiag
