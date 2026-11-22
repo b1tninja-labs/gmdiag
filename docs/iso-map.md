@@ -12,7 +12,8 @@ alive, and the response-pending loop. Every citation here was read through the `
 | DiagnosticSessionControl `0x10` — enter a session | ISO 14229-1:2013 §9.2 | `Session::enter_session`. Table 23 (§9.2.1) lists `0x10` as allowed in default and non-default sessions. |
 | TesterPresent `0x3E` — keep the session alive | ISO 14229-1:2013 §9.6 | `Session::tester_present`. Sub-function `zeroSubFunction` (`0x00`); the positive response is requested, not suppressed (see the note in the method). |
 | Response-pending `0x78` loop | ISO 14229-1:2013 §7.5.1 | `Session::exchange`. The server answers `0x78` (requestCorrectlyReceived-ResponsePending) and the final response arrives as a later message; gmdiag waits through it via `Transport::read_more`, bounded by `response_pending_limit`. |
-| ISO-TP single-frame transmit (raw-CAN path) | ISO 15765-2:2016 §9.2.1 | The planned `IsoTpCan` transport frames with `isotpkit`; the ELM327 transport leaves ISO-TP to the adapter. |
+| ISO-TP single-frame transmit (raw-CAN path) | ISO 15765-2:2016 §9.2.1 | The `IsoTpCan` transport frames with `isotpkit`; the ELM327 transport leaves ISO-TP to the adapter. |
+| ISO-TP multi-frame pacing on the raw-CAN path: wait for FlowControl after the FirstFrame, send ConsecutiveFrames up to `BlockSize`, honour `STmin`; grant the sender a FlowControl ContinueToSend when the response is multi-frame | ISO 15765-2:2016 §9.3, §9.6.5 | `IsoTpCan::send_pdu` / `recv_pdu`. The segmentation and reassembly themselves are `isotpkit`'s (anchored in `isotpkit/docs/iso-map.md`); gmdiag only drives the exchange over the `CanLink` seam. `N_WFTmax` (§9.7) bounds the FlowControl WAIT loop. |
 
 ## Where the rest is anchored (not duplicated here)
 

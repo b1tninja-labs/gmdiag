@@ -20,9 +20,14 @@ Tests live beside the code (`src/**` `#[cfg(test)]`) and in `tests/fakeobd_live.
 | [ok] | Adapter status words (`NO DATA`, `CAN ERROR`, `?`, ...) become adapter errors, not PDUs | ELM327 status replies | `transport::elm327::tests::status_words_become_adapter_errors` |
 | [ok] | The transport is neutral: a negative-response PDU passes through unchanged | — | `transport::elm327::tests::negative_response_is_passed_through_as_a_pdu` |
 | [ok] | A PDU is hex-encoded with no separators for the wire | ELM327 input | `transport::elm327::tests::hex_compact_has_no_separators` |
-| [ok] | The planned raw-CAN transport frames a PDU with isotpkit | ISO 15765-2:2016 §9.2.1 | `transport::isotp_can::tests::a_short_pdu_segments_into_one_frame` |
-| [ok] | The raw-CAN transport refuses `request` until a CAN interface exists (no guessing) | — | `transport::isotp_can::tests::request_is_refused_until_an_interface_exists` |
-| [open] | A live raw-CAN (`IsoTpCan`) link over SocketCAN / a real interface | ISO 15765-2:2016 | none |
+| [ok] | The raw-CAN transport frames a PDU with isotpkit | ISO 15765-2:2016 §9.2.1 | `transport::isotp_can::tests::a_short_pdu_segments_into_one_frame` |
+| [ok] | The raw-CAN transport refuses `request` until a target is set (no guessing) | — | `transport::isotp_can::tests::request_is_refused_until_a_target_is_set` |
+| [ok] | `IsoTpCan` drives a multi-frame request end to end over the `CanLink` seam: segmentation out, flow-control paced, reassembly in | ISO 15765-2:2016 §9.3 | `transport::isotp_can::tests::a_multi_frame_request_round_trips_over_the_can_seam` |
+| [ok] | The raw-CAN transport is neutral: a negative-response PDU passes through unchanged | — | `transport::isotp_can::tests::a_negative_response_is_surfaced_not_swallowed` |
+| [ok] | A FlowControl OVFLW from the receiver aborts the request, not silently drops it | ISO 15765-2:2016 §9.6.5 | `transport::isotp_can::tests::a_flow_control_overflow_aborts_the_request` |
+| [ok] | The SLCAN frame codec round-trips a standard 11-bit CAN frame and ignores non-data lines | LAWICEL SLCAN (serial; not in primarysource) | `transport::isotp_can::tests::slcan_rx_parses_a_standard_frame_and_ignores_acks` |
+| [open] | On-vehicle validation of `IsoTpCan` over a real SLCAN dongle / SocketCAN interface | ISO 15765-2:2016 | none |
+| [open] | A native SocketCAN (`AF_CAN`) `CanLink` on Linux (needs `unsafe`/`libc`, forbidden crate-wide) | — | none |
 | [open] | A J2534 / VCX transport via vcxtoolkit | SAE J2534 (not in primarysource) | none |
 | [open] | End-to-end against obd-bridge + a real ELM327/STN adapter | — (needs hardware) | none |
 
