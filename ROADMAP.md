@@ -40,7 +40,7 @@ Tests live beside the code (`src/**` `#[cfg(test)]`) and in `tests/fakeobd_live.
 | [ok] | The live DTC scan names the simulator's DTCs via gmdtcdb | gmdtcdb | `fakeobd_live::reads_the_whole_stack_against_the_simulator` |
 | [ok] | Mode $06 `0x06` returns results and labels the OBDMID via mode06kit | mode06kit; GM Mode $06 | `fakeobd_live::reads_the_whole_stack_against_the_simulator` |
 | [ok] | SecurityAccess `0x27` builds/reads a requestSeed and derives NO key | udskit::security; ISO 14229-1 §9.4 | `fakeobd_live::security_access_seed_is_refused_and_no_key_is_derived` |
-| [ok] | sendKey needs `Arm::Actuate` and an externally supplied key; it is never derived | udskit::security | `session::tests::send_key_requires_actuate_and_never_derives` |
+| [ok] | sendKey needs `Arm::Actuate` AND an `Authorizer` grant; the key is externally supplied, never derived | udskit::security; ISO 14229-1:2013 §9.4.1 | `session::tests::send_key_needs_actuate_then_authorization_and_never_derives` |
 | [ok] | The `Arm` level gates writes: read-only refuses, write/actuate allow, in order | — | `session::tests::arm_ordering_gates_writes` |
 | [ok] | A write is refused locally when read-only, and refused by the sim's policy when armed | obd-policy (fakeobd) | `fakeobd_live::writes_are_gated_locally_then_refused_by_the_simulator` |
 | [ok] | A time-driven keep-alive clock starts not-due | — | `session::tests::keepalive_starts_not_due` |
@@ -48,6 +48,35 @@ Tests live beside the code (`src/**` `#[cfg(test)]`) and in `tests/fakeobd_live.
 | [open] | WriteDataByIdentifier `0x2E` coding accepted end-to-end (needs a writable target) | ISO 14229-1:2013 §10.4 | none |
 | [open] | A concurrent keep-alive over a muxing relay (a single ELM link cannot carry one) | — | none |
 | [open] | The ADIT ALD RSA-2048 challenge/response is **documented only**, never automated | docs/security-access.md | none |
+
+## Authorization
+
+The actuation-tier services check a second gate on top of the `Arm` level: an `Authorizer`
+(`src/authorizer.rs`). The `Arm` level is the operator's *local intent*; the authorizer is the
+*external authorization* that may actually unlock a key-bearing or programming op. The write-gating
+decision: coding and clearing (`0x2E`/`0x14`) carry **no** key material, so they stay on the `Arm`
+gate alone (an armed, confirmed write reaches the bus — the fakeobd write test pins that); `sendKey`
+(`0x27`), routine start/stop (`0x31`) and device control (`0x2F`) additionally require an
+`AuthGrant`. With the default `NoAuthorizer` nothing that needs real authorization unlocks on its
+own, and gmdiag holds no key material. The legitimate route is `TechlinekitAuthorizer`, which
+delegates to the operator's authenticated Techline Connect / TDS subscription over a **process
+boundary** (techlinekit is Python; gmdiag is Rust, so no FFI) — not key-cracking.
+
+The TDS RE (2026-11-21) confirmed the broker mechanism: GM's SPS2 (`sps2.jar`) exposes a
+server-side seed→key service. The authenticated session POSTs `{seed, vin, algorithmNumber}` (an
+encrypted `SecureEndpoint` body) to `/sps/module-unlock/enc/{iecs|iecs/key-provisioning|isuzu}`
+under its `bearer` JWT and the server returns the `key`. gmdiag's `AuthKind::SecurityAccess` now
+carries those broker inputs (`vin`, `algorithm`). It stays `[open]`: techlinekit must still grow the
+broker subcommand and replicate SPS2's encryption envelope and per-module endpoint selection.
+
+| Status | Obligation | Anchor | Test |
+| --- | --- | --- | --- |
+| [ok] | The `Authorizer` seam governs actuation on top of `Arm`; the default `NoAuthorizer` grants nothing, so no request shape unlocks and gmdiag holds no key material | ISO 14229-1:2013 §9.4.1 (the key is "appropriate for the Seed received" — obtained, not derived) | `authorizer::tests::no_authorizer_grants_nothing_whatever_the_request` |
+| [ok] | sendKey needs `Arm::Actuate` AND an `AuthGrant`; with `NoAuthorizer` it is refused before any byte, and the key is never derived | ISO 14229-1:2013 §9.4.1 | `session::tests::send_key_needs_actuate_then_authorization_and_never_derives` |
+| [ok] | Routine start/stop and device control each need `Arm::Actuate` AND an `AuthGrant`; results (`0x03`) stays a read | ISO 14229-1:2013 §9 (RoutineControl / InputOutputControl, via udskit) | `session::tests::routine_start_needs_actuate_and_authorization_but_results_is_a_read`; `session::tests::io_control_needs_actuate_and_authorization` |
+| [ok] | Coding/clearing carry no key material and stay on the `Arm` gate alone (an armed write reaches the bus) | — | `session::tests::coding_and_clearing_stay_on_the_arm_gate_only`; `fakeobd_live::writes_are_gated_locally_then_refused_by_the_simulator` |
+| [ok] | The `TechlinekitAuthorizer` stub resolves its entry point but brokers nothing yet (clearly marked) | — | `authorizer::tests::techlinekit_authorizer_is_a_clearly_marked_stub` |
+| [open] | `TechlinekitAuthorizer` brokers a real `AuthGrant` over a process boundary: the TDS session returns the `0x27` key from GM's SPS2 seed→key service (`POST /sps/module-unlock/enc/*`, `{seed, vin, algorithmNumber}` → `key` under the TLC bearer). Blocked on techlinekit growing the broker subcommand + SecureEndpoint envelope + per-module endpoint mapping | SPS2 `sps2.jar` module-unlock clients; Techline Connect / TDS (not in primarysource) | none |
 
 ## CLI and fakeobd-first
 
@@ -58,5 +87,6 @@ Tests live beside the code (`src/**` `#[cfg(test)]`) and in `tests/fakeobd_live.
 | [ok] | An unknown command is refused before any link is opened | — | `cli::tests::unknown_command_is_rejected_without_opening_a_link` |
 | [ok] | `catalog` is offline reference and never opens a link | — | `cli::tests::catalog_is_offline_and_lists_services` |
 | [ok] | `--write` / `--actuate` set the session arm level | — | `cli::tests::parse_sets_arm_from_flags` |
+| [ok] | `--techline` installs the techlinekit authorizer (default: none, actuation locked) | — | `cli::tests::parse_sets_the_authorizer_from_the_techline_flag` |
 | [ok] | Hex arguments parse (even length, hex digits) | — | `cli::tests::parse_hex_round_trips` |
 | [ok] | `--dry-run` spawns fakeobd and drives the whole stack against it | — | `fakeobd_live::cli_dry_run_spawns_fakeobd_when_the_binary_is_on_path_or_env` |
