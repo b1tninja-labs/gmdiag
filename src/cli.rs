@@ -46,6 +46,12 @@ pub fn run(args: &[String], confirm: &mut dyn FnMut(&str) -> bool) -> (i32, Stri
     if opts.command[0] == "catalog" {
         return (0, catalog(&opts.command[1..]));
     }
+    // `vcx-read` drives the VCX-NANO directly, not the ELM327/TCP link, so it bypasses
+    // the fakeobd spawn and the loopback transport entirely. It is read-only and
+    // owner-gated; see `crate::vcx_read`.
+    if opts.command[0] == "vcx-read" {
+        return crate::vcx_read::run(&opts.command[1..]);
+    }
     match dispatch(&opts, confirm) {
         Ok(text) => (0, text),
         Err(e) => (1, e.to_string()),
@@ -493,6 +499,13 @@ pub fn usage() -> String {
          \u{20}  mode06 <obdmid>        Mode $06 monitor results, labelled via mode06kit\n\
          \u{20}  session [type]         DiagnosticSessionControl 0x10 + TesterPresent 0x3E\n\
          \u{20}  catalog <what>         offline reference (services|routines|security|dids), no link\n\
+         \n\
+         VCX-NANO read (read-only; drives the dongle, not the TCP link):\n\
+         \u{20}  vcx-read --port <N> [--ping] [--print-only] [--lid <hex>] [--out <file>]\n\
+         \u{20}                        GMLAN $1A identity read over the VCX-NANO (--ping: just the\n\
+         \u{20}                        TesterPresent $3E 00 probe). Transmits by default on Windows;\n\
+         \u{20}                        --print-only for a dry run. $3E/$1A only, never $27;\n\
+         \u{20}                        logs every byte.\n\
          \n\
          Gated commands (need the flag AND a confirmation):\n\
          \u{20}  write <did> <hex>      WriteDataByIdentifier 0x2E            [--write]\n\

@@ -7,7 +7,11 @@ permissions:
   contents: read
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # gmdiag is a Windows-only tool (the live VCX transmit is #[cfg(windows)] and the
+    # dongle is a Windows USB serial device), so CI runs on Windows. A Linux runner
+    # only flags cross-platform dead-code/unused-import noise in code paths this tool
+    # never uses off Windows.
+    runs-on: windows-latest
     steps:
       # gmdiag path-depends on its portfolio siblings by `../<name>`. Check each one
       # out as a flat sibling directory so `../udskit` … `../vcxtoolkit` resolve, then
@@ -51,7 +55,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
