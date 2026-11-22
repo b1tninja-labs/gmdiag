@@ -9,19 +9,63 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # gmdiag path-deps its siblings (`../udskit`, `../isotpkit`, `../gmdtcdb`, `../mode06kit`), so
+      # CI checks each out next to gmdiag and runs cargo from the gmdiag subdir. All are public
+      # b1tninja-labs repos, so the default GITHUB_TOKEN reads them; they track their default branch.
       - uses: actions/checkout@v4
+        with:
+          path: gmdiag
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/udskit
+          path: udskit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/isotpkit
+          path: isotpkit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/gmdtcdb
+          path: gmdtcdb
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/mode06kit
+          path: mode06kit
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
+        working-directory: gmdiag
       - run: cargo clippy --all-targets -- -D warnings
+        working-directory: gmdiag
       - run: cargo test
+        working-directory: gmdiag
       - run: cargo doc --no-deps
+        working-directory: gmdiag
         env:
           RUSTDOCFLAGS: -D warnings
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: gmdiag
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/udskit
+          path: udskit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/isotpkit
+          path: isotpkit
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/gmdtcdb
+          path: gmdtcdb
+      - uses: actions/checkout@v4
+        with:
+          repository: b1tninja-labs/mode06kit
+          path: mode06kit
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo test
+        working-directory: gmdiag
