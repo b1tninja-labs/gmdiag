@@ -210,13 +210,7 @@ fn forward_err(error: vcxtoolkit::ForwardError) -> Error {
 /// Unlike a plain `exchange_with`, a timeout here reports **which** command had no
 /// reply and dumps the raw bytes the dongle sent (if any), so an on-car bring-up
 /// failure pins the exact step instead of a bare "no complete frame".
-fn command_step<S: SerialPort>(
-    port: &S,
-    label: &str,
-    header: [u8; 4],
-    payload: &[u8],
-    timeout: Duration,
-) -> Result<Vec<u8>>
+fn write_frame<S: SerialPort>(port: &S, label: &str, header: [u8; 4], payload: &[u8]) -> Result<()>
 where
     S::Error: std::fmt::Display,
 {
@@ -239,7 +233,25 @@ where
             }
         }
     }
+    Ok(())
+}
 
+/// Write one VCX command (`label` names it for diagnostics), then read the dongle's
+/// reply frame and return it (header + payload).
+///
+/// A timeout reports **which** command had no reply and dumps the raw bytes the
+/// dongle sent, so an on-car bring-up failure pins the exact step.
+fn command_step<S: SerialPort>(
+    port: &S,
+    label: &str,
+    header: [u8; 4],
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<vcxtoolkit::Frame>
+where
+    S::Error: std::fmt::Display,
+{
+    write_frame(port, label, header, payload)?;
     let deadline = std::time::Instant::now() + timeout;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 512];
@@ -249,7 +261,7 @@ where
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(frame) = first_complete_frame(&buf) {
-                    return Ok(frame.payload);
+                    return Ok(frame);
                 }
             }
             Err(error) => {
@@ -268,6 +280,24 @@ where
     }
 }
 
+/// One diagnostic line summarising a reply frame: its command byte and payload.
+fn frame_line(label: &str, frame: &vcxtoolkit::Frame) -> String {
+    format!(
+        "  {label}: reply cmd {:#04X}, payload {:02X?}\n",
+        frame.header[2], frame.payload
+    )
+}
+
+/// Prepend the bring-up `trace` to an error while keeping its kind (a link failure
+/// stays [`Error::Io`]; a protocol refusal stays [`Error::Protocol`]).
+fn prepend_trace(trace: &str, error: Error) -> Error {
+    match error {
+        Error::Io(inner) => Error::Io(std::io::Error::other(format!("{trace}  {inner}"))),
+        Error::Protocol(message) => Error::Protocol(format!("{trace}  {message}")),
+        other => other,
+    }
+}
+
 /// Bring the ISO 15765 channel up on the dongle: the recovered `PassThruConnect`
 /// sequence `VCX_PRO_Open` → `SetComParam(baud)` → `AddFilter(flow control)` →
 /// `ProStart`. Runs once per [`VcxByteSource`]; later exchanges reuse the channel.
@@ -282,6 +312,7 @@ fn bring_up_channel<S: SerialPort>(
     req_id: u16,
     resp_id: u16,
     timeout: Duration,
+    trace: &mut String,
 ) -> Result<()>
 where
     S::Error: std::fmt::Display,
@@ -293,23 +324,25 @@ where
 
     // 1. Open the ISO 15765 data channel (the reply must echo VCX_PRO_Open). A
     //    failure here is labelled so the step is unambiguous on hardware.
-    channel.open(port, timeout).map_err(|error| match &error {
+    let open = channel.open(port, timeout).map_err(|error| match &error {
         // A link timeout/port failure stays Io; a wrong echo or refusal is Protocol.
         vcxtoolkit::DeviceError::Open(_) | vcxtoolkit::DeviceError::Send(_) => Error::Io(
             std::io::Error::other(format!("bring-up VCX_PRO_Open (0x40): {error}")),
         ),
         _ => Error::Protocol(format!("bring-up VCX_PRO_Open (0x40): {error}")),
     })?;
+    trace.push_str(&frame_line("open (0x40)", &open));
 
     // 2. SetComParam: the CAN baud, the recovered PassThruConnect SetComParam record.
     let com = set_com_param(&[baud_record(DEFAULT_CAN_BAUD)]).map_err(forward_err)?;
-    command_step(
+    let reply = command_step(
         port,
         "bring-up SetComParam (0x45)",
         Command::ProSetComParam.header(ch),
         &com,
         timeout,
     )?;
+    trace.push_str(&frame_line("SetComParam (0x45)", &reply));
 
     // 3. AddFilter: the ISO 15765 flow-control filter. Skipped when no ids are set
     //    (the bare open+send path the offline tests drive).
@@ -327,23 +360,25 @@ where
         })
         .map_err(forward_err)?;
         let payload = add_filter(&[filter]).map_err(forward_err)?;
-        command_step(
+        let reply = command_step(
             port,
             "bring-up AddFilter (0x48)",
             Command::ProAddFilter.header(ch),
             &payload,
             timeout,
         )?;
+        trace.push_str(&frame_line("AddFilter (0x48)", &reply));
     }
 
     // 4. Start the channel.
-    command_step(
+    let reply = command_step(
         port,
         "bring-up ProStart (0x42)",
         Command::ProStart.header(ch),
         &start_payload(),
         timeout,
     )?;
+    trace.push_str(&frame_line("ProStart (0x42)", &reply));
     Ok(())
 }
 
@@ -366,14 +401,52 @@ fn first_complete_frame(buf: &[u8]) -> Option<vcxtoolkit::Frame> {
     None
 }
 
-/// Read the reply frame the dongle PUSHES after a `VCX_PRO_Send` ack.
+/// The smallest `VCX_PRO_Recv` envelope that can carry an application reply: the
+/// 4-byte flags dword plus the 2-byte length. A shorter frame payload (e.g. the
+/// 1-byte `0x9B` status ack) is not an ECU reply and is logged, not returned.
+const MIN_RECV_ENVELOPE: usize = 6;
+
+/// Every complete `0xBB`…`0xBB` frame in `buf`, in order.
+fn all_frames(buf: &[u8]) -> Vec<vcxtoolkit::Frame> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != 0xBB {
+            i += 1;
+            continue;
+        }
+        let mut advanced = false;
+        for close in (i + 1)..buf.len() {
+            if buf[close] == 0xBB {
+                if let Ok(frame) = vcxtoolkit::unpack(&buf[i..=close]) {
+                    out.push(frame);
+                    i = close + 1;
+                    advanced = true;
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Read what the dongle returns after a `VCX_PRO_Send`, returning the first
+/// envelope-shaped reply frame's payload.
 ///
-/// `VCX_PRO_Recv` is virtualized and unrecovered; the dongle instead pushes the ECU
-/// reply on the serial as its own `0xBB` frame once the channel is up. This reads
-/// that frame and returns its payload — the `VCX_PRO_Recv` envelope
-/// [`vcxtoolkit::collect::reply_application_bytes`] consumes. On a timeout it returns
-/// the raw bytes seen, so an on-car run that does not match this model is diagnosable.
-fn read_pushed_frame<S: SerialPort>(port: &S, timeout: Duration) -> Result<Vec<u8>>
+/// After `ProStart` the Send is not answered by a synchronous reply frame; the ECU
+/// reply arrives as its own pushed `0xBB` frame (and the dongle may also emit a short
+/// status frame). This returns the first frame whose payload is at least a
+/// `VCX_PRO_Recv` envelope ([`MIN_RECV_ENVELOPE`]). If none arrives within `timeout`,
+/// the error carries the full bring-up trace, every frame seen, and the raw bytes, so
+/// an on-car run that does not match this model is fully diagnosable.
+fn read_reply_after_send<S: SerialPort>(
+    port: &S,
+    timeout: Duration,
+    trace: &mut String,
+) -> Result<Vec<u8>>
 where
     S::Error: std::fmt::Display,
 {
@@ -383,17 +456,22 @@ where
     loop {
         match port.read(&mut chunk) {
             Ok(0) => {}
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(frame) = first_complete_frame(&buf) {
-                    return Ok(frame.payload);
-                }
-            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(error) => return Err(Error::Io(std::io::Error::other(error.to_string()))),
         }
+        if let Some(frame) = all_frames(&buf)
+            .into_iter()
+            .find(|frame| frame.payload.len() >= MIN_RECV_ENVELOPE)
+        {
+            return Ok(frame.payload);
+        }
         if std::time::Instant::now() >= deadline {
+            for frame in &all_frames(&buf) {
+                trace.push_str(&frame_line("after Send", frame));
+            }
             return Err(Error::Protocol(format!(
-                "no pushed reply frame within {} ms after the Send ack (raw bytes: {buf:02X?})",
+                "{trace}  VCX_PRO_Send: no ECU reply frame (>= {MIN_RECV_ENVELOPE} payload bytes) \
+                 within {} ms; raw bytes from dongle: {buf:02X?}",
                 timeout.as_millis(),
             )));
         }
@@ -406,31 +484,33 @@ where
     S::Error: std::fmt::Display,
 {
     fn exchange(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
+        let mut trace = String::from("\n  channel bring-up / reply trace:\n");
         // Bring the ISO 15765 channel up once; every later exchange reuses it.
         if !self.connected {
-            bring_up_channel(
+            if let Err(error) = bring_up_channel(
                 &self.port,
                 self.channel,
                 self.req_id,
                 self.resp_id,
                 self.timeout,
-            )?;
+                &mut trace,
+            ) {
+                return Err(prepend_trace(&trace, error));
+            }
             self.connected = true;
         }
 
-        // Send the caller's already-framed VCX_PRO_Send request. The Send reply is
-        // only the dongle's 1-byte status ack (0x9B is normal); the ECU reply is
-        // pushed on the serial as a separate frame after the ack.
-        let _ack = command_step(
+        // Write the caller's already-framed VCX_PRO_Send. After ProStart the Send is
+        // not answered synchronously; the ECU reply is pushed as its own frame.
+        write_frame(
             &self.port,
             "VCX_PRO_Send",
             vcxtoolkit::pro_send_header(self.channel.caller, self.channel.channel),
             framed_request,
-            self.timeout,
         )?;
 
-        // Read the pushed reply frame; its payload is the VCX_PRO_Recv envelope.
-        read_pushed_frame(&self.port, self.timeout)
+        // Read the pushed reply; its payload is the VCX_PRO_Recv envelope.
+        read_reply_after_send(&self.port, self.timeout, &mut trace)
     }
 }
 
@@ -523,20 +603,15 @@ mod tests {
         pack([0x80, 0x00, cmd, DEFAULT_CHANNEL], &[]).unwrap()
     }
 
-    // The 1-byte status ack a VCX_PRO_Send returns (0x9B on hardware). It is read and
-    // discarded; the ECU reply arrives as the pushed frame after it.
-    fn send_ack() -> Vec<u8> {
-        pack([0x80, 0x00, 0x00, DEFAULT_CHANNEL], &[0x9B]).unwrap()
-    }
-
-    // The ECU reply frame the dongle pushes after the Send ack. Its payload is the
-    // recovered VCX_PRO_Recv envelope the adapter unwraps.
+    // The ECU reply frame the dongle pushes after the Send. Its payload is the
+    // recovered VCX_PRO_Recv envelope (>= 6 bytes) the adapter unwraps.
     fn pushed(app: &[u8]) -> Vec<u8> {
         pack([0x80, 0x00, 0x00, DEFAULT_CHANNEL], &recv_envelope(app)).unwrap()
     }
 
     // Every frame one full exchange consumes with no filter (req/resp ids 0): the
-    // open, SetComParam and Start acks, the Send ack, then the pushed ECU frame.
+    // open, SetComParam and Start acks, then the pushed ECU reply (the Send is
+    // write-only — no synchronous ack is read).
     const PRO_SETCOMPARAM: u8 = 0x45;
     const PRO_START: u8 = 0x42;
     fn connected_reads(app: &[u8]) -> Vec<Vec<u8>> {
@@ -544,7 +619,6 @@ mod tests {
             open_ack(),
             cmd_ack(PRO_SETCOMPARAM),
             cmd_ack(PRO_START),
-            send_ack(),
             pushed(app),
         ]
     }
