@@ -11,11 +11,20 @@
 //! SecurityAccess `sendKey` need [`Arm::Actuate`]. The *confirmation* prompt is the caller's job
 //! (the CLI prompts before it calls); the arm level is the hard gate the session enforces so a
 //! read-only run cannot emit a write even by mistake.
+//!
+//! The actuation-tier services (`sendKey`, routine start/stop, device control) check a *second*
+//! gate on top of the Arm level: an [`Authorizer`]. The Arm level is the operator's local intent;
+//! the authorizer is the external authorization that may actually unlock a key-bearing or
+//! programming operation. The default [`NoAuthorizer`] grants nothing, so out of the box gmdiag
+//! unlocks nothing on its own authority and holds no key material (see [`crate::authorizer`] and
+//! `docs/security-access.md`). Coding and clearing (`0x2E`/`0x14`) carry no key material, so they
+//! stay on the local Arm gate alone.
 
 use std::time::{Duration, Instant};
 
 use udskit::message::{self, NegativeResponse, PositiveResponse, Response};
 
+use crate::authorizer::{AuthGrant, AuthRequest, Authorizer, NoAuthorizer};
 use crate::error::{Error, Result};
 use crate::transport::{Target, Transport};
 
@@ -90,12 +99,15 @@ pub struct Session<T: Transport> {
     transport: T,
     target: Target,
     arm: Arm,
+    /// The external authorization gate for actuation-tier services (defaults to [`NoAuthorizer`]).
+    authorizer: Box<dyn Authorizer>,
     /// How many response-pending (`0x78`) follow-ups to wait through before giving up.
     pub response_pending_limit: u32,
 }
 
 impl<T: Transport> Session<T> {
-    /// Open a session: point the transport at `target`. Read-only until armed.
+    /// Open a session: point the transport at `target`. Read-only until armed, and with the
+    /// default [`NoAuthorizer`] (no actuation unlocks on its own).
     ///
     /// # Errors
     /// Returns an error when the transport cannot be pointed at `target`.
@@ -105,6 +117,7 @@ impl<T: Transport> Session<T> {
             transport,
             target,
             arm: Arm::ReadOnly,
+            authorizer: Box::new(NoAuthorizer),
             response_pending_limit: 8,
         })
     }
@@ -118,6 +131,20 @@ impl<T: Transport> Session<T> {
     /// Arm the session. A caller raises this only after the operator has confirmed.
     pub fn set_arm(&mut self, arm: Arm) {
         self.arm = arm;
+    }
+
+    /// Install the authorizer for actuation-tier services, replacing the default [`NoAuthorizer`].
+    ///
+    /// The authorizer is consulted *in addition to* the [`Arm`] gate: an actuation proceeds only
+    /// when the session is armed *and* the authorizer grants. See [`crate::authorizer`].
+    pub fn set_authorizer(&mut self, authorizer: Box<dyn Authorizer>) {
+        self.authorizer = authorizer;
+    }
+
+    /// The name of the installed authorizer (`none` for the default [`NoAuthorizer`]).
+    #[must_use]
+    pub fn authorizer_name(&self) -> &'static str {
+        self.authorizer.name()
     }
 
     /// The target this session drives.
@@ -134,6 +161,14 @@ impl<T: Transport> Session<T> {
         self.transport.set_target(target)?;
         self.target = target;
         Ok(())
+    }
+
+    /// Consult the authorizer for `request`, mapping a refusal to [`Error::Refused`] so a governed
+    /// operation that is not authorized stays locked — the same outcome shape as the [`Arm`] gate.
+    fn authorize(&self, request: &AuthRequest) -> Result<AuthGrant> {
+        self.authorizer
+            .authorize(request)
+            .map_err(|e| Error::Refused(e.to_string()))
     }
 
     /// Send one request and decode the response, running the `0x78` response-pending loop.
@@ -244,7 +279,7 @@ impl<T: Transport> Session<T> {
     ///
     /// This is a read: it returns the server's seed bytes. gmdiag derives no key from the seed —
     /// `udskit`'s boundary holds (see `docs/security-access.md`). A gated service stays locked
-    /// unless a key is supplied with [`Session::security_send_key`].
+    /// unless a key is supplied with [`Session::security_send_key`] *and* an [`Authorizer`] grants.
     ///
     /// # Errors
     /// See [`Session::positive`]; plus [`Error::from`] when `level` is not a requestSeed level.
@@ -258,21 +293,40 @@ impl<T: Transport> Session<T> {
 
     // ----- gated writes / actuation -------------------------------------------------------
 
-    /// SecurityAccess (`0x27`) sendKey: send an **externally supplied** key for `level`.
+    /// SecurityAccess (`0x27`) sendKey: send a key for `level`, gated by the [`Authorizer`].
     ///
-    /// gmdiag never computes `key`; the operator supplies it. Needs [`Arm::Actuate`].
+    /// Two gates must both open: [`Arm::Actuate`] (the operator's local intent) and the
+    /// authorizer (the external authorization). gmdiag never computes `key`. With the default
+    /// [`NoAuthorizer`] this stays locked and no byte is sent — gmdiag emits no SecurityAccess key
+    /// on its own authority. When an authorizer grants, the key that is actually sent is the
+    /// grant's key if it carries one (the techlinekit path produces the key), otherwise the
+    /// externally supplied `key`, which the grant vouches for. ISO 14229-1:2013 §9.4.1: the key is
+    /// one "appropriate for the Seed received".
     ///
     /// # Errors
-    /// [`Error::Refused`] when not armed to actuate; otherwise see [`Session::positive`].
+    /// [`Error::Refused`] when not armed to actuate or not authorized; otherwise see
+    /// [`Session::positive`].
     pub fn security_send_key(&mut self, level: u8, key: &[u8]) -> Result<PositiveResponse> {
         self.arm.require(Arm::Actuate, "SecurityAccess sendKey")?;
+        // The authorization gate on top of the Arm gate. The live seed is not in hand here (the
+        // operator supplies the key), so the request carries an empty seed; a grant that carries
+        // its own key wins, otherwise the supplied `key` is sent, authorized by the grant.
+        let grant = self.authorize(&AuthRequest::security_access(level, &[]))?;
+        let send_key = match grant {
+            AuthGrant::SecurityKey(k) => k,
+            AuthGrant::Entitlement(_) => key.to_vec(),
+        };
         let send_level = udskit::security::send_key_for(level)?;
         let mut data = vec![send_level];
-        data.extend_from_slice(key);
+        data.extend_from_slice(&send_key);
         self.positive(0x27, &data)
     }
 
     /// WriteDataByIdentifier (`0x2E`): code a DID. Needs [`Arm::Write`].
+    ///
+    /// Coding carries no key material, so it is governed by the local [`Arm`] gate alone, not the
+    /// [`Authorizer`]: an armed, confirmed write reaches the bus (and the server's own policy and
+    /// any session-level security it enforces decide the rest).
     ///
     /// # Errors
     /// [`Error::Refused`] when not armed to write; otherwise see [`Session::positive`].
@@ -286,7 +340,8 @@ impl<T: Transport> Session<T> {
 
     /// ClearDiagnosticInformation (`0x14`): clear a DTC group. Needs [`Arm::Write`].
     ///
-    /// `group` is the 3-byte group (`0xFF_FFFF` clears all).
+    /// `group` is the 3-byte group (`0xFF_FFFF` clears all). Like coding, this carries no key
+    /// material and is governed by the local [`Arm`] gate alone.
     ///
     /// # Errors
     /// [`Error::Refused`] when not armed to write; otherwise see [`Session::positive`].
@@ -299,11 +354,13 @@ impl<T: Transport> Session<T> {
     /// RoutineControl (`0x31`): start/stop/request-results of a routine.
     ///
     /// `requestRoutineResults` (`0x03`) is a read; `startRoutine`/`stopRoutine`
-    /// (`0x01`/`0x02`) are actuation and need [`Arm::Actuate`].
+    /// (`0x01`/`0x02`) are actuation and need [`Arm::Actuate`] *and* an [`Authorizer`] grant (a
+    /// routine is an SPS/programming vector). With the default [`NoAuthorizer`] a start/stop stays
+    /// locked.
     ///
     /// # Errors
-    /// [`Error::Refused`] when a start/stop is sent without actuation arming; otherwise see
-    /// [`Session::positive`].
+    /// [`Error::Refused`] when a start/stop is sent without actuation arming or without
+    /// authorization; otherwise see [`Session::positive`].
     pub fn routine(
         &mut self,
         subfunction: u8,
@@ -313,15 +370,21 @@ impl<T: Transport> Session<T> {
         if subfunction != udskit::routine::REQUEST_ROUTINE_RESULTS {
             self.arm
                 .require(Arm::Actuate, "RoutineControl start/stop")?;
+            self.authorize(&AuthRequest::programming(format!(
+                "RoutineControl sub-function {subfunction:02X} routine {routine_id:04X}"
+            )))?;
         }
         let pdu = udskit::routine::build_request(subfunction, routine_id, data)?;
         self.positive(pdu[0], &pdu[1..])
     }
 
-    /// InputOutputControlByIdentifier (`0x2F`) / GM device control. Needs [`Arm::Actuate`].
+    /// InputOutputControlByIdentifier (`0x2F`) / GM device control. Needs [`Arm::Actuate`] *and*
+    /// an [`Authorizer`] grant (device control actuates the vehicle). With the default
+    /// [`NoAuthorizer`] it stays locked.
     ///
     /// # Errors
-    /// [`Error::Refused`] when not armed to actuate; otherwise see [`Session::positive`].
+    /// [`Error::Refused`] when not armed to actuate or not authorized; otherwise see
+    /// [`Session::positive`].
     pub fn io_control(
         &mut self,
         did: u16,
@@ -330,6 +393,9 @@ impl<T: Transport> Session<T> {
     ) -> Result<PositiveResponse> {
         self.arm
             .require(Arm::Actuate, "InputOutputControl (device control)")?;
+        self.authorize(&AuthRequest::programming(format!(
+            "InputOutputControl DID {did:04X} parameter {parameter:02X}"
+        )))?;
         let pdu = udskit::iocontrol::build_request(did, parameter, control_state)?;
         self.positive(pdu[0], &pdu[1..])
     }
@@ -413,6 +479,7 @@ fn parse_dtc_by_status(data: &[u8]) -> Result<Vec<DtcReport>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorizer::{AuthError, Authorizer};
 
     /// A scripted transport: each `request`/`read_more` pops the next canned response PDU.
     struct MockTransport {
@@ -445,6 +512,20 @@ mod tests {
         }
     }
 
+    /// A test authorizer that grants every request with an entitlement go-ahead. It stands in for
+    /// a real broker so the authorized path can be exercised without techlinekit; it produces no
+    /// key, so [`Session::security_send_key`] still forwards the operator's own supplied bytes.
+    struct GrantAll;
+
+    impl Authorizer for GrantAll {
+        fn authorize(&self, _request: &AuthRequest) -> std::result::Result<AuthGrant, AuthError> {
+            Ok(AuthGrant::Entitlement(Vec::new()))
+        }
+        fn name(&self) -> &'static str {
+            "grant-all (test)"
+        }
+    }
+
     fn mock_session(responses: Vec<Vec<u8>>) -> Session<MockTransport> {
         Session::new(MockTransport::new(responses), Target::new(0x7E0, 0x7E8)).unwrap()
     }
@@ -473,9 +554,15 @@ mod tests {
     }
 
     #[test]
-    fn send_key_requires_actuate_and_never_derives() {
-        // sendKey takes the requestSeed (odd) level; the pair is level+1. Read-only and
-        // write-armed sessions both refuse before any byte is sent.
+    fn default_authorizer_is_none() {
+        let s = mock_session(vec![]);
+        assert_eq!(s.authorizer_name(), "none");
+    }
+
+    #[test]
+    fn send_key_needs_actuate_then_authorization_and_never_derives() {
+        // sendKey takes the requestSeed (odd) level; the pair is level+1. The Arm gate fires first:
+        // read-only and write-armed sessions both refuse before any byte is sent.
         let mut s = mock_session(vec![]);
         assert!(matches!(
             s.security_send_key(0x01, &[0xDE, 0xAD]),
@@ -486,19 +573,102 @@ mod tests {
             s.security_send_key(0x01, &[0xDE, 0xAD]),
             Err(Error::Refused(_))
         ));
-        // Armed to actuate, the supplied key is sent (the mock accepts it with 0x67).
+        // Armed to actuate but with the default NoAuthorizer: the authorization gate keeps it
+        // locked. gmdiag unlocks nothing on its own authority and derives no key.
+        s.set_arm(Arm::Actuate);
+        assert!(matches!(
+            s.security_send_key(0x01, &[0xDE, 0xAD]),
+            Err(Error::Refused(_))
+        ));
+        // Armed to actuate AND authorized: the externally supplied key is sent (the mock accepts it
+        // with 0x67). gmdiag still never derives the key — it forwards the operator's bytes,
+        // vouched for by the grant.
         let mut s = Session::new(
             MockTransport::new(vec![vec![0x67, 0x02]]),
             Target::new(0x7E0, 0x7E8),
         )
         .unwrap();
         s.set_arm(Arm::Actuate);
+        s.set_authorizer(Box::new(GrantAll));
         assert_eq!(
             s.security_send_key(0x01, &[0xDE, 0xAD])
                 .unwrap()
                 .response_sid,
             0x67
         );
+    }
+
+    #[test]
+    fn routine_start_needs_actuate_and_authorization_but_results_is_a_read() {
+        // Armed to actuate, default NoAuthorizer: a start is locked by the authorization gate.
+        let mut s = mock_session(vec![]);
+        s.set_arm(Arm::Actuate);
+        assert!(matches!(
+            s.routine(udskit::routine::START_ROUTINE, 0x0203, &[]),
+            Err(Error::Refused(_))
+        ));
+        // requestRoutineResults is a read: no arm and no authorizer needed, the mock answers.
+        let mut s = mock_session(vec![vec![0x71, 0x03, 0x02, 0x03]]);
+        assert!(
+            s.routine(udskit::routine::REQUEST_ROUTINE_RESULTS, 0x0203, &[])
+                .is_ok()
+        );
+        // Armed and authorized: the start is sent and accepted.
+        let mut s = Session::new(
+            MockTransport::new(vec![vec![0x71, 0x01, 0x02, 0x03]]),
+            Target::new(0x7E0, 0x7E8),
+        )
+        .unwrap();
+        s.set_arm(Arm::Actuate);
+        s.set_authorizer(Box::new(GrantAll));
+        assert_eq!(
+            s.routine(udskit::routine::START_ROUTINE, 0x0203, &[])
+                .unwrap()
+                .response_sid,
+            0x71
+        );
+    }
+
+    #[test]
+    fn io_control_needs_actuate_and_authorization() {
+        // Armed to actuate, default NoAuthorizer: device control is locked by the authorization gate.
+        let mut s = mock_session(vec![]);
+        s.set_arm(Arm::Actuate);
+        assert!(matches!(
+            s.io_control(0x1234, udskit::iocontrol::SHORT_TERM_ADJUSTMENT, &[]),
+            Err(Error::Refused(_))
+        ));
+        // Armed and authorized: the device-control request is sent.
+        let mut s = Session::new(
+            MockTransport::new(vec![vec![0x6F, 0x12, 0x34, 0x03]]),
+            Target::new(0x7E0, 0x7E8),
+        )
+        .unwrap();
+        s.set_arm(Arm::Actuate);
+        s.set_authorizer(Box::new(GrantAll));
+        assert!(
+            s.io_control(0x1234, udskit::iocontrol::SHORT_TERM_ADJUSTMENT, &[])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn coding_and_clearing_stay_on_the_arm_gate_only() {
+        // write_did and clear_dtcs carry no key material: they are refused read-only, and with only
+        // Arm::Write (no authorizer) they reach the transport. This is the boundary the
+        // fakeobd_live write test also pins end-to-end.
+        let mut s = mock_session(vec![]);
+        assert!(matches!(
+            s.write_did(0x002F, &[0x00]),
+            Err(Error::Refused(_))
+        ));
+        let mut s = Session::new(
+            MockTransport::new(vec![vec![0x6E, 0x00, 0x2F]]),
+            Target::new(0x7E0, 0x7E8),
+        )
+        .unwrap();
+        s.set_arm(Arm::Write); // no authorizer installed; still the default NoAuthorizer
+        assert!(s.write_did(0x002F, &[0x00]).is_ok());
     }
 
     #[test]

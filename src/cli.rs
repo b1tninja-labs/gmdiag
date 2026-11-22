@@ -7,7 +7,15 @@
 //! Reads (`scan`, `did`, `seed`, `mode06`, `session`, `catalog`) run with no flag. Writes
 //! (`write`, `clear`) need `--write`; actuation (`routine` start/stop, `iocontrol`, `sendkey`)
 //! needs `--actuate`. Each gated command also asks the confirmation callback before it sends.
+//!
+//! Actuation has a second gate on top of the arm level: an [`Authorizer`](crate::authorizer). By
+//! default it is [`NoAuthorizer`](crate::authorizer::NoAuthorizer), so `sendkey`, `routine`
+//! start/stop and `iocontrol` are refused — gmdiag unlocks nothing on its own authority and holds
+//! no key material. `--techline` installs the [`TechlinekitAuthorizer`], which delegates to the
+//! operator's authenticated techlinekit subscription over a process boundary (a documented stub
+//! today; see [`crate::authorizer`]).
 
+use crate::authorizer::TechlinekitAuthorizer;
 use crate::error::{Error, Result};
 use crate::session::{Arm, Session};
 use crate::spawn::{self, FakeObd};
@@ -18,6 +26,9 @@ use crate::transport::elm327::Elm327Tcp;
 pub const DEFAULT_TARGET: &str = "127.0.0.1:35000";
 
 /// Parsed invocation options.
+// Several independent on/off flags (dry-run, addressing, loopback, authorizer): an options struct,
+// not a state machine, so the bool-count lint does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 struct Opts {
     target: String,
@@ -26,6 +37,7 @@ struct Opts {
     gmlan: bool,
     allow_non_loopback: bool,
     arm: Arm,
+    use_techlinekit: bool,
     command: Vec<String>,
 }
 
@@ -76,6 +88,11 @@ fn dispatch(opts: &Opts, confirm: &mut dyn FnMut(&str) -> bool) -> Result<String
     // Keep the simulator alive for the session's lifetime when dry-running.
     let (mut session, _peer) = connect(opts)?;
     session.set_arm(opts.arm);
+    // Install the external authorization gate when asked. The default is NoAuthorizer, so
+    // actuation stays locked unless the operator opts into the techlinekit broker.
+    if opts.use_techlinekit {
+        session.set_authorizer(Box::new(TechlinekitAuthorizer::new()));
+    }
     let rest = &opts.command[1..];
     match cmd {
         "scan" => scan(&mut session, rest),
@@ -338,17 +355,17 @@ fn catalog(rest: &[String]) -> String {
             .map(|s| format!("{:02X} {}", s.sid, s.name))
             .collect::<Vec<_>>()
             .join("\n"),
-        "routines" => udskit::routine::catalog()
+        "routines" => udskit::gm::routines::catalog()
             .iter()
             .map(|r| format!("{} {} (risk {}) — {}", r.hex(), r.name, r.risk, r.effect))
             .collect::<Vec<_>>()
             .join("\n"),
-        "security" => udskit::security::MECHANISMS
+        "security" => udskit::gm::security::MECHANISMS
             .iter()
             .map(|(k, m)| format!("{k}: {} [{}] — {}", m.name, m.family, m.summary))
             .collect::<Vec<_>>()
             .join("\n\n"),
-        "dids" => udskit::did::read_dids()
+        "dids" => udskit::gm::dids::read_dids()
             .iter()
             .map(|d| format!("{} [{}]", d.hex(), d.category))
             .collect::<Vec<_>>()
@@ -367,6 +384,7 @@ fn parse(args: &[String]) -> Result<Opts> {
     let mut allow_non_loopback = false;
     let mut write_flag = false;
     let mut actuate_flag = false;
+    let mut use_techlinekit = false;
     let mut command = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -392,6 +410,7 @@ fn parse(args: &[String]) -> Result<Opts> {
                 actuate_flag = true;
                 write_flag = true;
             }
+            "--techline" => use_techlinekit = true,
             _ => command.push(a.clone()),
         }
     }
@@ -409,6 +428,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         gmlan,
         allow_non_loopback,
         arm,
+        use_techlinekit,
         command,
     })
 }
@@ -485,6 +505,7 @@ pub fn usage() -> String {
          \u{20}  --allow-non-loopback   permit a non-loopback adapter address\n\
          \u{20}  --write                arm coding/clearing (0x2E, 0x14)\n\
          \u{20}  --actuate              arm routines/device-control/sendKey (0x31, 0x2F, 0x27) + write\n\
+         \u{20}  --techline             authorize actuation via techlinekit (default: none → locked)\n\
          \n\
          Read commands (no flag):\n\
          \u{20}  scan [mask]            ReadDTCInformation 0x19 02, named via gmdtcdb\n\
@@ -497,10 +518,13 @@ pub fn usage() -> String {
          Gated commands (need the flag AND a confirmation):\n\
          \u{20}  write <did> <hex>      WriteDataByIdentifier 0x2E            [--write]\n\
          \u{20}  clear [group]          ClearDiagnosticInformation 0x14      [--write]\n\
-         \u{20}  routine start|stop|results <rid> [hex]  RoutineControl 0x31 [--actuate for start/stop]\n\
-         \u{20}  iocontrol <did> <param> [hex]  InputOutputControl 0x2F      [--actuate]\n\
-         \u{20}  sendkey <level> <key>  SecurityAccess sendKey (key supplied) [--actuate]\n\
+         \u{20}  routine start|stop|results <rid> [hex]  RoutineControl 0x31 [--actuate + authz for start/stop]\n\
+         \u{20}  iocontrol <did> <param> [hex]  InputOutputControl 0x2F      [--actuate + authz]\n\
+         \u{20}  sendkey <level> <key>  SecurityAccess sendKey (key supplied) [--actuate + authz]\n\
          \n\
+         Actuation (sendkey/routine start-stop/iocontrol) also needs authorization: by default\n\
+         none is configured, so it stays locked. gmdiag holds no key material and unlocks nothing\n\
+         on its own; `--techline` routes authorization to the techlinekit subscription (stub).\n\
          Owner-authorised vehicles only. Every write is read-first-by-default and confirmed."
     )
 }
@@ -534,6 +558,16 @@ mod tests {
         assert_eq!(
             parse(&["--actuate".into(), "sendkey".into()]).unwrap().arm,
             Arm::Actuate
+        );
+    }
+
+    #[test]
+    fn parse_sets_the_authorizer_from_the_techline_flag() {
+        assert!(!parse(&["scan".into()]).unwrap().use_techlinekit);
+        assert!(
+            parse(&["--techline".into(), "sendkey".into()])
+                .unwrap()
+                .use_techlinekit
         );
     }
 

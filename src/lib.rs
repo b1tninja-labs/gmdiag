@@ -17,16 +17,26 @@
 //! - [`session`] — a [`Session`](session::Session) over a transport: session control,
 //!   TesterPresent keep-alive, the `0x78` response-pending loop, and the UDS services, each
 //!   write/actuation gated by an [`Arm`](session::Arm) level.
+//! - [`authorizer`] — the second gate. An [`Authorizer`](authorizer::Authorizer) is the external
+//!   authorization consulted *on top of* the Arm level before an actuation-tier op unlocks. The
+//!   default [`NoAuthorizer`](authorizer::NoAuthorizer) grants nothing;
+//!   [`TechlinekitAuthorizer`](authorizer::TechlinekitAuthorizer) delegates to the authenticated
+//!   techlinekit subscription over a process boundary.
 //! - [`spawn`] — spawns `fakeobd` for the fakeobd-first dry-run and the tests.
 //! - [`cli`] — the read-first command line.
 //!
 //! # Boundaries
 //!
-//! gmdiag derives **no** SecurityAccess key: it builds and reads a `requestSeed`, but a `sendKey`
-//! carries only a key the operator supplies. It opens no bus beyond the ELM line protocol (raw
-//! CAN and J2534/VCX are planned). It acts only on an owner-authorised vehicle, and its whole
+//! gmdiag derives **no** SecurityAccess key and holds **no** key material: it builds and reads a
+//! `requestSeed`, but a `sendKey` carries only a key supplied from outside and proceeds only when
+//! an [`Authorizer`](authorizer::Authorizer) grants. With the default
+//! [`NoAuthorizer`](authorizer::NoAuthorizer) nothing that needs real authorization unlocks on its
+//! own; the legitimate route is the operator's authenticated techlinekit subscription, invoked
+//! over a process boundary, never key-cracking. gmdiag opens no bus beyond the ELM line protocol
+//! (raw CAN and J2534/VCX are planned). It acts only on an owner-authorised vehicle, and its whole
 //! stack runs against a spawned `fakeobd` simulator with no hardware.
 
+pub mod authorizer;
 pub mod cli;
 pub mod error;
 pub mod session;
