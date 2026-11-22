@@ -5,7 +5,7 @@
 //! could live apart from the offline assembly logic. This module is that
 //! implementation. It satisfies the injected seam by driving vcxtoolkit's
 //! recovered channel-open plus `VCX_PRO_Send`/`VCX_PRO_Recv` exchange
-//! ([`vcxtoolkit::Channel`]) over a real USB serial [`vcxtoolkit::Port`], so the
+//! ([`vcxtoolkit::Channel`]) over a real USB serial `vcxtoolkit::Port`, so the
 //! same [`VcxTransport`](crate::vcx::VcxTransport) that a test drives over canned
 //! frames runs against a VCX-NANO dongle.
 //!
@@ -13,8 +13,8 @@
 //!
 //! The COM port is chosen by the detection layer — `voltkit`'s wizard surfaces the
 //! VCX-NANO as a detected COM number, and `vcxtoolkit`'s `doctor` identifies on any
-//! port. So [`VcxByteSource::open`] takes the port number as a parameter and opens
-//! it with [`vcxtoolkit::open_usb`]; it assumes no fixed COM. [`DEFAULT_DOCTOR_PORT`]
+//! port. So `VcxByteSource::open` takes the port number as a parameter and opens
+//! it with `vcxtoolkit::open_usb`; it assumes no fixed COM. [`DEFAULT_DOCTOR_PORT`]
 //! exists only as the doctor's default convenience and stays overridable.
 //!
 //! # The logic is generic over the serial seam; only opening the port is hardware
@@ -23,7 +23,7 @@
 //! exchange → return-payload logic is therefore exercised in tests by an in-process
 //! fake serial, exactly as `vcxtoolkit`'s own `device` tests drive the channel over
 //! canned bytes. The only hardware-specific part — opening the real
-//! [`Port`](vcxtoolkit::Port) — is isolated in the Windows-only [`VcxByteSource::open`]
+//! `Port` — is isolated in the Windows-only `VcxByteSource::open`
 //! constructor, so the seam logic is tested without hardware.
 //!
 //! # The live vehicle read stays gated and ignored
@@ -51,13 +51,13 @@ use crate::vcx::ByteSource;
 ///
 /// `vcxtoolkit`'s own hardware round-trips use a two-second deadline (the dongle
 /// answers `GetInfo` and a channel open well within it); the identity read reuses
-/// that budget. Overridable through [`VcxByteSource::open_with_params`].
+/// that budget. Overridable through `VcxByteSource::open_with_params`.
 pub const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The default pass-through channel byte (`VCX_PRO_Open`/`VCX_PRO_Send` header byte
 /// 3). This is the caller's channel, not a value recovered from the VXDIAG binaries
 /// (`vcxtoolkit::pro_send_header` documents bytes 1 and 3 as the caller's arguments),
-/// so it defaults to `0` and is overridable through [`VcxByteSource::open_with_params`].
+/// so it defaults to `0` and is overridable through `VcxByteSource::open_with_params`.
 pub const DEFAULT_CHANNEL: u8 = 0;
 
 /// The default caller byte (`VCX_PRO_Send` header byte 1). Like [`DEFAULT_CHANNEL`]
@@ -77,7 +77,7 @@ pub const DEFAULT_DOCTOR_PORT: u32 = 4;
 ///
 /// It is generic over the serial seam so an in-process fake drives the whole
 /// construct → exchange → return-payload path in tests, while the real path opens a
-/// USB [`Port`](vcxtoolkit::Port). Each [`exchange`](ByteSource::exchange) opens the
+/// USB `Port`. Each [`exchange`](ByteSource::exchange) opens the
 /// ISO 15765 channel and writes the caller's already-framed `VCX_PRO_Send` request
 /// (the output of [`vcxtoolkit::collect::frame_identity_request`], which the
 /// [`VcxTransport`](crate::vcx::VcxTransport) produced), then returns the reply
@@ -95,7 +95,7 @@ impl<S: SerialPort> VcxByteSource<S> {
     /// Build a byte seam over an already-open serial `port`.
     ///
     /// This is the seam-generic constructor the fake serial uses in tests and the
-    /// Windows-only [`VcxByteSource::open`] builds on. It opens no channel and sends
+    /// Windows-only `VcxByteSource::open` builds on. It opens no channel and sends
     /// nothing; it only validates that the ISO 15765 open dword resolves.
     ///
     /// `channel` and `caller` are the caller-supplied VCX framing bytes
