@@ -103,6 +103,10 @@ pub struct VcxByteSource<S: SerialPort> {
     /// (open → SetComParam → AddFilter → Start). The bring-up runs once; every
     /// later exchange reuses the open channel and only does Send + the pushed read.
     connected: bool,
+    /// A one-line note from the device hello (GetInfo + the `80 00 A0` licence
+    /// challenge) the real-hardware constructor runs before the channel bring-up, or
+    /// empty for the offline/simulator seams. Prepended to the first exchange's trace.
+    hello_note: String,
 }
 
 impl<S: SerialPort> VcxByteSource<S> {
@@ -128,6 +132,7 @@ impl<S: SerialPort> VcxByteSource<S> {
             req_id: 0,
             resp_id: 0,
             connected: false,
+            hello_note: String::new(),
         })
     }
 
@@ -154,6 +159,25 @@ impl<S: SerialPort> VcxByteSource<S> {
     #[must_use]
     pub fn port(&self) -> &S {
         &self.port
+    }
+}
+
+/// Settle time after opening the USB port before the first command. The vendor DLL
+/// waits for its Rx thread to come up (~300 ms) before GetInfo; without it the first
+/// command's reply arrives too late and desyncs the next one.
+#[cfg(windows)]
+const SETTLE_AFTER_OPEN_MS: u64 = 400;
+
+/// Drain any bytes the dongle buffered (boot chatter / a late reply) so the next
+/// command's reply is read cleanly. Reads until the port has nothing waiting.
+#[cfg(windows)]
+fn drain(port: &vcxtoolkit::Port) {
+    let mut scratch = [0u8; 256];
+    for _ in 0..64 {
+        match port.read(&mut scratch) {
+            Ok(n) if n > 0 => {}
+            _ => break,
+        }
     }
 }
 
@@ -193,7 +217,25 @@ impl VcxByteSource<vcxtoolkit::Port> {
     pub fn open_with_params(port: u32, channel: u8, caller: u8, timeout: Duration) -> Result<Self> {
         let serial = vcxtoolkit::open_usb(port, 0)
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
-        Self::with_port(serial, channel, caller, timeout)
+        // The dongle needs a moment after the port opens before it answers the first
+        // command — the vendor DLL waits ~300 ms (its Rx thread settles) before
+        // GetInfo. Without this the first GetInfo times out and its late reply
+        // desyncs the next command. Settle, then drain any boot bytes.
+        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_OPEN_MS));
+        drain(&serial);
+        // Device UNLOCK FIRST, on the concrete port: send the A0 command with the
+        // recovered firmware constant (vcxtoolkit::unlock_device). Without it a real
+        // dongle answers VCX_PRO_Open with a locked status (0xFE) and never forwards
+        // CAN; with it (status 0x00) the channel opens. Verified live on a VCX-NANO.
+        // Best-effort: the outcome is recorded for the trace, not fatal.
+        let hello_note = match vcxtoolkit::unlock_device(&serial, timeout) {
+            Ok(0x00) => "  device unlock: A0 accepted (status 00)\n".to_string(),
+            Ok(status) => format!("  device unlock: A0 status {status:#04X} (not unlocked)\n"),
+            Err(error) => format!("  device unlock: A0 exchange failed: {error}\n"),
+        };
+        let mut source = Self::with_port(serial, channel, caller, timeout)?;
+        source.hello_note = hello_note;
+        Ok(source)
     }
 }
 
@@ -487,6 +529,9 @@ where
         let mut trace = String::from("\n  channel bring-up / reply trace:\n");
         // Bring the ISO 15765 channel up once; every later exchange reuses it.
         if !self.connected {
+            // The real-hardware constructor ran the device hello before this; surface
+            // its outcome in the bring-up trace (empty for the offline/simulator seam).
+            trace.push_str(&self.hello_note);
             if let Err(error) = bring_up_channel(
                 &self.port,
                 self.channel,

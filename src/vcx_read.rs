@@ -100,8 +100,12 @@ impl Default for Opts {
             lids: DEFAULT_IDENTITY_LIDS.to_vec(),
             out: None,
             ecu: "BECM".to_string(),
-            req_header: 0x7E0,
-            resp_header: 0x7E8,
+            // The BECM / hybrid controller answers on the OBD-style physical pair
+            // 0x7E4 / 0x7EC (resp = req + 0x08), confirmed by on-car captures of the
+            // GMLAN $1A identity read (the ECM's 7E0/7E8 is a different, often-asleep
+            // module). Override with --req/--resp for another controller.
+            req_header: 0x7E4,
+            resp_header: 0x7EC,
             channel: 0,
             caller: 0,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
@@ -452,6 +456,9 @@ fn transmit(opts: &Opts) -> (i32, String) {
             opts.caller,
             opts.timeout,
         ) {
+            // open_with_params runs the device hello (licence challenge) before the
+            // channel bring-up, as the vendor DLL does; the simulate() path uses
+            // with_port, which does no hello, so its fake serial is unaffected.
             Ok(s) => s.with_can_ids(opts.req_header, opts.resp_header),
             Err(e) => {
                 logln(&mut log, format!("  !! could not open the dongle: {e}"));
@@ -967,8 +974,8 @@ pub fn usage() -> String {
      \u{20}  --lid <hex>        a $1A identifier to read (repeatable; default C1..CA, CB, CC)\n\
      \u{20}  --out <file>       write the assembled saved-read to <file>\n\
      \u{20}  --ecu <name>       saved-read controller name (metadata; default BECM)\n\
-     \u{20}  --req <hex>        request CAN id, sent as the 4-byte raw-mode prefix (default 7E0)\n\
-     \u{20}  --resp <hex>       expected response CAN id / saved-read header (default 7E8)\n\
+     \u{20}  --req <hex>        request CAN id, sent as the 4-byte raw-mode prefix (default 7E4, the BECM)\n\
+     \u{20}  --resp <hex>       expected response CAN id / saved-read header (default 7EC)\n\
      \u{20}  --channel <hex>    VCX framing channel byte (default 00)\n\
      \u{20}  --caller <hex>     VCX framing caller byte (default 00)\n\
      \u{20}  --timeout-ms <n>   per-step exchange timeout (default 2000)\n\
@@ -1038,6 +1045,9 @@ mod tests {
         assert_eq!(o.port, 4);
         assert!(!o.print_only);
         assert_eq!(o.lids, DEFAULT_IDENTITY_LIDS.to_vec());
+        // Default target is the BECM (0x7E4 / 0x7EC), not the ECM (0x7E0/0x7E8).
+        assert_eq!(o.req_header, 0x7E4);
+        assert_eq!(o.resp_header, 0x7EC);
     }
 
     #[test]
