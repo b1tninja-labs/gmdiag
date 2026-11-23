@@ -18,11 +18,12 @@ mode06kit = { path = "../mode06kit" }
 # vcxtoolkit: the recovered VCX frame codecs (frame_identity_request / reply_application_bytes)
 # and the saved module-read writer (modread) for the offline identity-collection adapter.
 vcxtoolkit = { path = "../vcxtoolkit" }
-
-# The vendor-DLL read transport (Windows only): vcikit-j2534 loads a registered/located
-# J2534 pass-through DLL (VXDIAG VCXPT32.dll), so `vcx-read --dll <path>` runs the SAME
-# read loop over the vendor DLL and produces the identical saved-read as the native path.
-[target.'cfg(windows)'.dependencies]
+# vcikit: the transport-agnostic raw-mode (PassThru) VCI abstraction (the RawBackend seam +
+# LinkConfig) that VciTransport bridges onto the Transport trait; vcikit-j2534 supplies the
+# registered-DLL J2534 backend. The unsafe FFI stays in vcikit-j2534, so gmdiag keeps unsafe
+# forbidden. Declared here (not under a cfg(windows) target table) because VciTransport is
+# cross-platform; vcikit-j2534 compiles everywhere and gates its registry read internally. Also
+# serves vcx_j2534's vendor-DLL read (`vcx-read --dll <path>` loads VXDIAG's VCXPT32.dll by path).
 vcikit = { path = "../vcikit" }
 vcikit-j2534 = { path = "../vcikit/j2534" }
 
