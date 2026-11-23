@@ -51,6 +51,7 @@ pub mod vcx;
 pub mod vcx_device;
 #[cfg(windows)]
 pub mod vcx_j2534;
+pub mod vcx_license;
 pub mod vcx_read;
 
 pub use error::{Error, Result};

@@ -52,6 +52,10 @@ pub fn run(args: &[String], confirm: &mut dyn FnMut(&str) -> bool) -> (i32, Stri
     if opts.command[0] == "vcx-read" {
         return crate::vcx_read::run(&opts.command[1..]);
     }
+    // `vcx-license` reads the on-device licence (the hello) over the serial link.
+    if opts.command[0] == "vcx-license" {
+        return crate::vcx_license::run(&opts.command[1..]);
+    }
     match dispatch(&opts, confirm) {
         Ok(text) => (0, text),
         Err(e) => (1, e.to_string()),
@@ -501,6 +505,7 @@ pub fn usage() -> String {
          \u{20}  catalog <what>         offline reference (services|routines|security|dids), no link\n\
          \n\
          VCX-NANO read (read-only; drives the dongle, not the TCP link):\n\
+         \u{20}  vcx-license [--port <N>]   read the on-device VCX licence (the device hello)\n\
          \u{20}  vcx-read --port <N> [--ping] [--print-only] [--lid <hex>] [--out <file>]\n\
          \u{20}                        GMLAN $1A identity read over the VCX-NANO (--ping: just the\n\
          \u{20}                        TesterPresent $3E 00 probe). Transmits by default on Windows;\n\
