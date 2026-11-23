@@ -215,6 +215,7 @@ impl VcxByteSource<vcxtoolkit::Port> {
     /// Returns [`Error::Io`] when the port cannot be opened, or [`Error::Protocol`]
     /// from [`VcxByteSource::with_port`].
     pub fn open_with_params(port: u32, channel: u8, caller: u8, timeout: Duration) -> Result<Self> {
+        use std::fmt::Write as _;
         let serial = vcxtoolkit::open_usb(port, 0)
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         // The dongle needs a moment after the port opens before it answers the first
@@ -223,16 +224,31 @@ impl VcxByteSource<vcxtoolkit::Port> {
         // desyncs the next command. Settle, then drain any boot bytes.
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_OPEN_MS));
         drain(&serial);
-        // Device UNLOCK FIRST, on the concrete port: send the A0 command with the
-        // recovered firmware constant (vcxtoolkit::unlock_device). Without it a real
-        // dongle answers VCX_PRO_Open with a locked status (0xFE) and never forwards
-        // CAN; with it (status 0x00) the channel opens. Verified live on a VCX-NANO.
-        // Best-effort: the outcome is recorded for the trace, not fatal.
-        let hello_note = match vcxtoolkit::unlock_device(&serial, timeout) {
-            Ok(0x00) => "  device unlock: A0 accepted (status 00)\n".to_string(),
-            Ok(status) => format!("  device unlock: A0 status {status:#04X} (not unlocked)\n"),
-            Err(error) => format!("  device unlock: A0 exchange failed: {error}\n"),
-        };
+        // Hello THEN unlock. The firmware A0 unlock only takes after the licence
+        // handshake has run first: read_license does GetInfo + the A0 Diffie-Hellman
+        // challenge + GetLicense, which seeds the verifier's session key; only then does
+        // the A0 unlock constant flip VCX_PRO_Open from the locked 0xFE to 0x00. This is
+        // the sequence `unlock_test` proves from a clean dongle; the unlock alone (no
+        // preceding read_license) leaves the channel locked. Best-effort, logged.
+        let mut hello_note = String::new();
+        match vcxtoolkit::read_license(&serial, timeout) {
+            Ok(_) => hello_note.push_str("  device hello: licence handshake OK\n"),
+            Err(error) => {
+                let _ = writeln!(hello_note, "  device hello: licence read failed: {error}");
+            }
+        }
+        match vcxtoolkit::unlock_device(&serial, timeout) {
+            Ok(0x00) => hello_note.push_str("  device unlock: A0 accepted (status 00)\n"),
+            Ok(status) => {
+                let _ = writeln!(
+                    hello_note,
+                    "  device unlock: A0 status {status:#04X} (not unlocked)"
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(hello_note, "  device unlock: A0 exchange failed: {error}");
+            }
+        }
         let mut source = Self::with_port(serial, channel, caller, timeout)?;
         source.hello_note = hello_note;
         Ok(source)
@@ -505,7 +521,14 @@ where
             .into_iter()
             .find(|frame| frame.payload.len() >= MIN_RECV_ENVELOPE)
         {
-            return Ok(frame.payload);
+            let mut payload = frame.payload;
+            // The dongle encodes the VCX_PRO_Recv length as a BIG-ENDIAN u16 at offset
+            // 4..6, but the reply parser (and the J2534 rebuild and the sim) use a
+            // little-endian length. Swap the two bytes so the envelope matches. (On the
+            // car, the native reply `00 00 00 00 00 0A ...` differed from the J2534
+            // `00 00 00 00 0A 00 ...` only here, which truncated every parse.)
+            payload.swap(4, 5);
+            return Ok(payload);
         }
         if std::time::Instant::now() >= deadline {
             for frame in &all_frames(&buf) {
@@ -632,12 +655,13 @@ mod tests {
         pack([0x80, 0x00, PRO_OPEN_ECHO, DEFAULT_CHANNEL], &[]).unwrap()
     }
 
-    // A send reply frame whose payload is the recovered VCX_PRO_Recv envelope:
-    // flags u32 LE, len u16 LE, then the application bytes.
+    // A send reply frame whose payload is the VCX_PRO_Recv envelope exactly as the
+    // dongle pushes it: flags u32, then the length as a BIG-ENDIAN u16, then the
+    // application bytes. `read_reply_after_send` swaps the length to little-endian.
     fn recv_envelope(app: &[u8]) -> Vec<u8> {
         let mut pdu = Vec::new();
         pdu.extend_from_slice(&0_u32.to_le_bytes());
-        pdu.extend_from_slice(&u16::try_from(app.len()).unwrap().to_le_bytes());
+        pdu.extend_from_slice(&u16::try_from(app.len()).unwrap().to_be_bytes());
         pdu.extend_from_slice(app);
         pdu
     }
@@ -689,9 +713,11 @@ mod tests {
 
         let payload = seam.exchange(&framed_request).unwrap();
 
-        // The returned payload is the pushed ECU frame's envelope, exactly what
-        // reply_application_bytes consumes.
-        assert_eq!(payload, recv_envelope(&app));
+        // The returned payload is the pushed ECU frame's envelope with the length
+        // swapped to little-endian, exactly what reply_application_bytes consumes.
+        let mut expected = recv_envelope(&app);
+        expected.swap(4, 5);
+        assert_eq!(payload, expected);
         assert_eq!(reply_application_bytes(&payload).unwrap(), &app);
 
         // Four frames went out: the channel bring-up (open, SetComParam, Start), then
