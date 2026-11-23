@@ -223,13 +223,15 @@ impl VcxByteSource<vcxtoolkit::Port> {
         // desyncs the next command. Settle, then drain any boot bytes.
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_OPEN_MS));
         drain(&serial);
-        // Device hello FIRST, on the concrete port: the vendor DLL runs GetInfo + the
-        // 80 00 A0 licence challenge before VCX_PRO_Open. Without it a real dongle
-        // answers VCX_PRO_Open with a locked status (0xFE) and never forwards CAN.
+        // Device UNLOCK FIRST, on the concrete port: send the A0 command with the
+        // recovered firmware constant (vcxtoolkit::unlock_device). Without it a real
+        // dongle answers VCX_PRO_Open with a locked status (0xFE) and never forwards
+        // CAN; with it (status 0x00) the channel opens. Verified live on a VCX-NANO.
         // Best-effort: the outcome is recorded for the trace, not fatal.
-        let hello_note = match vcxtoolkit::read_license(&serial, timeout) {
-            Ok(_) => "  device hello: licence challenge OK\n".to_string(),
-            Err(error) => format!("  device hello: licence read failed: {error}\n"),
+        let hello_note = match vcxtoolkit::unlock_device(&serial, timeout) {
+            Ok(0x00) => "  device unlock: A0 accepted (status 00)\n".to_string(),
+            Ok(status) => format!("  device unlock: A0 status {status:#04X} (not unlocked)\n"),
+            Err(error) => format!("  device unlock: A0 exchange failed: {error}\n"),
         };
         let mut source = Self::with_port(serial, channel, caller, timeout)?;
         source.hello_note = hello_note;
