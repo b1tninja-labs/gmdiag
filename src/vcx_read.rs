@@ -240,12 +240,14 @@ fn simulate_reply(framed_request: &[u8], resp_id: u16) -> Vec<u8> {
     out
 }
 
-/// Wrap application bytes in the recovered `VCX_PRO_Recv` envelope: flags `u32` LE,
-/// length `u16` LE, then the bytes — exactly what [`crate`]'s reply parser consumes.
+/// Wrap application bytes in the `VCX_PRO_Recv` envelope the real dongle pushes:
+/// flags `u32`, then the length as a **big-endian** `u16`, then the bytes. The native
+/// read path (`read_reply_after_send`) swaps the length to little-endian before the
+/// parser sees it, so the sim stays faithful to hardware and exercises that swap.
 fn sim_recv_envelope(app: &[u8]) -> Vec<u8> {
     let mut pdu = Vec::with_capacity(6 + app.len());
     pdu.extend_from_slice(&0_u32.to_le_bytes());
-    pdu.extend_from_slice(&u16::try_from(app.len()).unwrap_or(0).to_le_bytes());
+    pdu.extend_from_slice(&u16::try_from(app.len()).unwrap_or(0).to_be_bytes());
     pdu.extend_from_slice(app);
     pdu
 }
