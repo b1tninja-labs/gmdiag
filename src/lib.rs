@@ -53,6 +53,7 @@ pub mod vcx_device;
 pub mod vcx_j2534;
 pub mod vcx_license;
 pub mod vcx_read;
+pub mod vcx_reset;
 
 pub use error::{Error, Result};
 

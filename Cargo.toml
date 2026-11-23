@@ -1,6 +1,6 @@
 [package]
 name = "gmdiag"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Live read/write GM Techline/GDS2 diagnostic driver: Transport trait + ELM327-over-TCP, UDS/GMLAN session core over udskit/gmdtcdb/mode06kit, read-first CLI with gated writes, fakeobd-first"
